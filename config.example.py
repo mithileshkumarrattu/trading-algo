@@ -38,10 +38,17 @@ MAX_SPREAD_PCT = 0.5
 # ---------------- DISCOVERY (Top movers) ----------------
 MIN_PCT_MOVE = 1.0
 MAX_PCT_MOVE = 5.0
-TOP_N_GAINERS = 15
-TOP_N_LOSERS = 15
+TOP_N_GAINERS = 10
+TOP_N_LOSERS = 10
 DISCOVERY_QUOTE_CHUNK = 45
-DISCOVERY_FULL_SCAN_INTERVAL_SEC = 15
+DISCOVERY_FULL_SCAN_INTERVAL_SEC = 20
+FINAL_UNIVERSE_LOCK_TIME = (11, 0, 0)
+SCAN_GROUP_SIZE_PER_SIDE = 5
+MAX_ACTIVE_SETUPS_BEFORE_EXPAND = 2
+
+# ---------------- FRESHNESS / STALE-SIGNAL FILTER ----------------
+MAX_ALPHA_AGE_MINUTES = 15
+EXPIRED_ALPHA_COOLDOWN_MINUTES = 360
 
 # ---------------- PATTERN (Alpha Candle) ----------------
 PATTERN_TIMEFRAME = 5           # minutes - trend run + Alpha Candle detection
@@ -85,8 +92,13 @@ SEND_TELEGRAM_ON_SETUP_WATCH = True
 SEND_TELEGRAM_ON_ENTRY = True
 SEND_TELEGRAM_ON_EXIT = True
 SEND_TELEGRAM_ON_LOGIN = True
-SEND_TELEGRAM_HEARTBEAT_MIN = 30   # periodic "still running" ping, 0 = disabled
-SEND_TELEGRAM_TOP_MOVERS = True   # push Top-10 gainers/losers to Telegram periodically
+SEND_TELEGRAM_HEARTBEAT_MIN = 0
+SEND_TELEGRAM_TOP_MOVERS = True
+TOP_MOVERS_TELEGRAM_TIMES = (
+	(9, 20, 0),
+	(10, 0, 0),
+	(11, 0, 0),
+)
 
 # ---------------- PATHS ----------------
 import os

@@ -23,8 +23,22 @@ import notifier
 logger = logging.getLogger(__name__)
 
 _last_full_scan = 0.0
-_last_telegram_push = 0.0
-TELEGRAM_PUSH_INTERVAL_SEC = 300  # push Top gainers/losers to Telegram every 5 min
+
+
+def _scheduled_mover_message_due():
+    now = datetime.now(config.TIME_ZONE)
+    today = now.date().isoformat()
+    snap = state.snapshot()
+    sent = set(snap.get("top_mover_telegram_slots_sent", []))
+
+    for hour, minute, second in config.TOP_MOVERS_TELEGRAM_TIMES:
+        slot_name = f"{today}_{hour:02d}{minute:02d}"
+        slot_time = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
+        if now >= slot_time and slot_name not in sent:
+            sent.add(slot_name)
+            state.update({"top_mover_telegram_slots_sent": sorted(sent)})
+            return True
+    return False
 
 
 def _fetch_batch_quotes(broker, security_ids):
@@ -48,7 +62,7 @@ def run_full_universe_scan(broker, universe_df):
     computes % change (works any time of day, market open or closed) -
     then ranks and pushes Top-10 gainers/losers straight into state.
     """
-    global _last_full_scan, _last_telegram_push
+    global _last_full_scan
 
     id_to_row = {int(r.SECURITY_ID): r for _, r in universe_df.iterrows()}
     sec_ids = list(id_to_row.keys())
@@ -93,15 +107,33 @@ def run_full_universe_scan(broker, universe_df):
     losers = sorted([r for r in rows if r["pct_change"] < 0], key=lambda x: x["pct_change"])[:config.TOP_N_LOSERS]
 
     state.update({"top_gainers": gainers, "top_losers": losers})
+    now = datetime.now(config.TIME_ZONE)
+    lock_time = now.replace(
+        hour=config.FINAL_UNIVERSE_LOCK_TIME[0],
+        minute=config.FINAL_UNIVERSE_LOCK_TIME[1],
+        second=config.FINAL_UNIVERSE_LOCK_TIME[2],
+        microsecond=0,
+    )
+    snapshot = state.snapshot()
+    if now >= lock_time and not snapshot.get("final_universe_locked", False):
+        state.update({
+            "final_universe_locked": True,
+            "final_top_gainers": gainers[:config.TOP_N_GAINERS],
+            "final_top_losers": losers[:config.TOP_N_LOSERS],
+            "final_universe_locked_at": now.isoformat(),
+        })
+        state.add_log(
+            f"Final 11:00 universe locked: {len(gainers[:config.TOP_N_GAINERS])} "
+            f"gainers / {len(losers[:config.TOP_N_LOSERS])} losers"
+        )
     _last_full_scan = time.time()
     state.update({"last_discovery_scan": datetime.now(config.TIME_ZONE).isoformat()})
 
     logger.info(f"Discovery scan complete: {len(gainers)} gainers, {len(losers)} losers qualify (of {len(quotes)} quoted)")
     state.add_log(f"Discovery refreshed: {len(gainers)} gainers / {len(losers)} losers in the {config.MIN_PCT_MOVE}%-{config.MAX_PCT_MOVE}% band")
 
-    if config.SEND_TELEGRAM_TOP_MOVERS and (time.time() - _last_telegram_push > TELEGRAM_PUSH_INTERVAL_SEC):
+    if config.SEND_TELEGRAM_TOP_MOVERS and _scheduled_mover_message_due():
         notifier.notify_top_movers(gainers, losers)
-        _last_telegram_push = time.time()
 
 
 def refresh_from_livefeed(broker, universe_df):

@@ -39,6 +39,12 @@ _DEFAULT_STATE = {
     "logs": [],
     "last_discovery_scan": None,
     "alerted_alpha_keys": [],  # dedup keys already Telegram-alerted this session
+    "expired_alpha_keys": {},  # alpha key -> cooldown expiry timestamp
+    "top_mover_telegram_slots_sent": [],
+    "final_universe_locked": False,
+    "final_top_gainers": [],
+    "final_top_losers": [],
+    "final_universe_locked_at": None,
 }
 
 
@@ -123,6 +129,10 @@ def append_closed_trade(trade: dict, max_trades: int = 200):
         _write_raw(data)
 
 
+def add_closed_trade(trade: dict):
+    append_closed_trade(trade)
+
+
 def add_to_daily_pnl(amount: float):
     with _LOCK:
         data = _read_raw()
@@ -148,6 +158,34 @@ def add_to_blacklist(security_id, signal_vol):
             "blacklisted_at": datetime.now(config.TIME_ZONE).isoformat(),
             "signal_vol": signal_vol,
         }
+        _write_raw(data)
+
+
+def get_blacklist_entry(security_id):
+    return snapshot().get("blacklist", {}).get(str(security_id))
+
+
+def set_blacklist(security_id, reason="", signal_volume=0):
+    add_to_blacklist(security_id, signal_volume)
+
+
+def is_expired_alpha(key: str) -> bool:
+    entry = snapshot().get("expired_alpha_keys", {}).get(key)
+    if not entry:
+        return False
+    return datetime.now(config.TIME_ZONE) < datetime.fromisoformat(entry)
+
+
+def mark_expired_alpha(key: str, expires_at=None):
+    from datetime import timedelta
+    if expires_at is None:
+        expired_at = datetime.now(config.TIME_ZONE)
+    else:
+        expired_at = datetime.fromisoformat(expires_at)
+    cooldown_until = expired_at + timedelta(minutes=config.EXPIRED_ALPHA_COOLDOWN_MINUTES)
+    with _LOCK:
+        data = _read_raw()
+        data.setdefault("expired_alpha_keys", {})[key] = cooldown_until.isoformat()
         _write_raw(data)
 
 

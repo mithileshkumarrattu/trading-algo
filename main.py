@@ -93,11 +93,25 @@ def heartbeat_loop():
 
 def build_scan_candidates():
     snap = state.snapshot()
-    candidates = []
-    for g in snap["top_gainers"]:
-        candidates.append({**g, "is_bullish_setup": True})
-    for l in snap["top_losers"]:
-        candidates.append({**l, "is_bullish_setup": False})
+    now = datetime.now(config.TIME_ZONE).time()
+    lock_time = timing.get_time(config.FINAL_UNIVERSE_LOCK_TIME)
+    use_locked = now >= lock_time
+    gainers = snap.get("final_top_gainers" if use_locked else "top_gainers", [])
+    losers = snap.get("final_top_losers" if use_locked else "top_losers", [])
+    active_count = len(snap.get("watchlist", {})) + len(snap.get("open_positions", {}))
+    group_size = config.SCAN_GROUP_SIZE_PER_SIDE
+    group_index = 0 if active_count < config.MAX_ACTIVE_SETUPS_BEFORE_EXPAND else 1
+    start = group_index * group_size
+    end = start + group_size
+    selected_gainers = gainers[start:end]
+    selected_losers = losers[start:end]
+    candidates = [{**row, "is_bullish_setup": True} for row in selected_gainers]
+    candidates.extend({**row, "is_bullish_setup": False} for row in selected_losers)
+    state.add_log(
+        f"Scan universe: {'FINAL LOCKED' if use_locked else 'LIVE'} "
+        f"group={group_index + 1}, gainers={len(selected_gainers)}, "
+        f"losers={len(selected_losers)}, active={active_count}"
+    )
     return candidates
 
 
@@ -136,7 +150,23 @@ def scan_candidate(broker, candidate, prev_trade_date):
 
         alpha = result["alpha_candle"]
         direction = "BUY" if is_bullish_setup else "SELL"
-        dedup_key = f"{security_id}_{direction}_{alpha.timestamp}"
+        alpha_open_time = alpha.timestamp.to_pydatetime()
+        alpha_close_time = alpha_open_time + timedelta(minutes=config.PATTERN_TIMEFRAME)
+        now = datetime.now(config.TIME_ZONE)
+        alpha_age_minutes = (now - alpha_close_time).total_seconds() / 60.0
+        alpha_key = f"{security_id}_{direction}_{alpha_open_time.isoformat()}"
+
+        if alpha_close_time > now:
+            state.add_log(f"{symbol}: Alpha ignored - 5-min candle has not closed yet ({alpha_open_time.isoformat()})")
+            return
+        if alpha_age_minutes > config.MAX_ALPHA_AGE_MINUTES:
+            state.add_log(f"{symbol}: stale Alpha ignored - {alpha_age_minutes:.1f} min old, candle={alpha_open_time.isoformat()}")
+            return
+        if state.is_expired_alpha(alpha_key):
+            state.add_log(f"{symbol}: expired Alpha ignored - key={alpha_key}")
+            return
+
+        dedup_key = alpha_key
         state.set_watchlist_item(security_id, {
             "symbol": symbol,
             "security_id": str(security_id),
@@ -146,14 +176,17 @@ def scan_candidate(broker, candidate, prev_trade_date):
             "alpha_high": float(alpha.high),
             "alpha_low": float(alpha.low),
             "alpha_volume": float(alpha.volume),
-            "alpha_detected_at": result["detected_at"].isoformat(),
+            "alpha_open_time": alpha_open_time.isoformat(),
+            "alpha_close_time": alpha_close_time.isoformat(),
+            "alpha_detected_at": now.isoformat(),
             "alpha_candle_time": str(alpha.timestamp),
             "trend_candle_count": len(result["trend_run"]),
             "current_ltp": None,
             "distance_to_trigger_pct": None,
-            "hold_expires_at": (result["detected_at"] + timedelta(
+            "hold_expires_at": (alpha_close_time + timedelta(
                 minutes=config.HOLD_CANDLES_5MIN * config.PATTERN_TIMEFRAME
             )).isoformat(),
+            "alpha_key": alpha_key,
         })
         if not state.has_alerted(dedup_key):
             if config.SEND_TELEGRAM_ON_SETUP_WATCH:
@@ -163,12 +196,17 @@ def scan_candidate(broker, candidate, prev_trade_date):
             state.add_log(f"{symbol}: Alpha Candle detected ({direction}) at {alpha.timestamp}")
         return
 
-    alpha_detected_at = datetime.fromisoformat(watchlist_entry["alpha_detected_at"])
-    if pattern.hold_window_expired(alpha_detected_at):
+    if "alpha_close_time" not in watchlist_entry or "alpha_key" not in watchlist_entry:
         state.remove_watchlist_item(security_id)
-        direction = "BUY" if is_bullish_setup else "SELL"
-        notifier.notify_setup_expired(symbol, direction)
-        state.add_log(f"{symbol}: Alpha setup expired, dropped from watch")
+        state.add_log(f"{symbol}: legacy Alpha watch removed; awaiting a fresh setup")
+        return
+
+    alpha_close_time = datetime.fromisoformat(watchlist_entry["alpha_close_time"])
+    if pattern.hold_window_expired(alpha_close_time):
+        state.remove_watchlist_item(security_id)
+        expiry_time = datetime.now(config.TIME_ZONE).isoformat()
+        state.mark_expired_alpha(watchlist_entry["alpha_key"], expires_at=expiry_time)
+        state.add_log(f"{symbol}: Alpha expired without breakout. 5-min candle={watchlist_entry['alpha_open_time']} expired_at={expiry_time}")
         return
 
     try:
@@ -178,7 +216,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
         )
         if candles_1m is None or candles_1m.empty:
             return
-        today_1m = candles_1m[candles_1m["timestamp"] >= alpha_detected_at]
+        today_1m = candles_1m[candles_1m["timestamp"] >= alpha_close_time].copy()
     except Exception:
         logger.exception(f"1-min candle fetch failed for {symbol}")
         return
@@ -206,8 +244,13 @@ def scan_candidate(broker, candidate, prev_trade_date):
         pass
 
     position = engine.enter_trade(
-        broker, security_id, symbol, is_bullish_setup,
-        watchlist_entry["alpha_high"], watchlist_entry["alpha_low"], trigger_candle, tick_size,
+        broker=broker, security_id=security_id, symbol=symbol,
+        is_bullish_setup=is_bullish_setup,
+        alpha_high=watchlist_entry["alpha_high"], alpha_low=watchlist_entry["alpha_low"],
+        entry_candle=trigger_candle, tick_size=tick_size,
+        alpha_open_time=watchlist_entry["alpha_open_time"],
+        alpha_close_time=watchlist_entry["alpha_close_time"],
+        alpha_key=watchlist_entry["alpha_key"],
     )
     if position is not None:
         state.remove_watchlist_item(security_id)

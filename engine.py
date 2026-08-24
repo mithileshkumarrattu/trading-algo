@@ -62,7 +62,8 @@ def can_take_new_trade():
     return True, None
 
 
-def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha_low, entry_candle, tick_size=0.05):
+def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha_low, entry_candle,
+                tick_size=0.05, alpha_open_time=None, alpha_close_time=None, alpha_key=None):
     ok, reason = can_take_new_trade()
     if not ok:
         state.add_log(f"{symbol}: entry blocked - {reason}")
@@ -117,10 +118,26 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
         "stall_counter": 0,
         "best_price_since_r2": entry_price,
         "cost_to_cost_trade": cost_to_cost_trade,
+        "alpha_key": alpha_key,
+        "alpha_open_time": alpha_open_time,
+        "alpha_close_time": alpha_close_time,
+        "alpha_high": float(alpha_high),
+        "alpha_low": float(alpha_low),
+        "trigger_1m_time": str(entry_candle.timestamp),
+        "trigger_1m_open": float(entry_candle.open),
+        "trigger_1m_high": float(entry_candle.high),
+        "trigger_1m_low": float(entry_candle.low),
+        "trigger_1m_close": float(entry_candle.close),
         "status": "OPEN",
     }
     state.set_open_position(security_id, position)
-    notifier.notify_entry(symbol, transaction_type, qty, entry_price, sl_price, target_r2_price, config.PAPER_MODE)
+    notifier.notify_entry(
+        symbol=symbol, direction=transaction_type, qty=qty,
+        entry_price=entry_price, sl_price=sl_price, target_price=target_r2_price,
+        paper_mode=config.PAPER_MODE, alpha_open_time=alpha_open_time,
+        alpha_high=alpha_high, alpha_low=alpha_low,
+        trigger_1m_time=str(entry_candle.timestamp),
+    )
     return position
 
 

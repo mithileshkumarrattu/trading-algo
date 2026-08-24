@@ -78,12 +78,23 @@ def notify_setup_expired(symbol, direction):
     send_telegram(f"⏱ <b>{symbol}</b> — {direction} Alpha setup expired without breakout. Dropped from watch.")
 
 
-def notify_entry(symbol, direction, qty, entry_price, sl_price, target_price, paper_mode):
+def notify_entry(symbol, direction, qty, entry_price, sl_price, target_price, paper_mode,
+                 alpha_open_time=None, alpha_high=None, alpha_low=None, trigger_1m_time=None):
     arrow = "🟢" if direction == "BUY" else "🔴"
+    alpha_level_name = "Alpha High" if direction == "BUY" else "Alpha Low"
+    alpha_level = alpha_high if direction == "BUY" else alpha_low
+    details = []
+    if alpha_open_time:
+        details.append(f"Alpha 5-min candle: {alpha_open_time}")
+    if alpha_level is not None:
+        details.append(f"{alpha_level_name}: ₹{float(alpha_level):.2f}")
+    if trigger_1m_time:
+        details.append(f"Breakout 1-min candle: {trigger_1m_time}")
+    audit_text = "\n" + "\n".join(details) if details else ""
     send_telegram(
         f"{arrow} {_tag(paper_mode)} <b>ENTRY {direction}</b> — {symbol}\n"
         f"Qty: {qty} | Entry: ₹{entry_price:.2f} | SL: ₹{sl_price:.2f} | Target (1:2): ₹{target_price:.2f}\n"
-        f"Risk: ₹{abs(entry_price - sl_price) * qty:.2f}"
+        f"Risk: ₹{abs(entry_price - sl_price) * qty:.2f}{audit_text}"
     )
 
 
