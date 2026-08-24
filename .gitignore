@@ -1,0 +1,28 @@
+# Secrets and environment
+.env
+.env.*
+config.py
+*token*
+*secret*
+*credential*
+*.key
+*.pem
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Runtime data
+data/
+logs/
+reports/
+*.log
+*.log.*
+*.json
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
