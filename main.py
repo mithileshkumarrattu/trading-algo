@@ -100,7 +100,7 @@ def build_scan_candidates():
     losers = snap.get("final_top_losers" if use_locked else "top_losers", [])
     active_count = len(snap.get("watchlist", {})) + len(snap.get("open_positions", {}))
     group_size = config.SCAN_GROUP_SIZE_PER_SIDE
-    group_index = 0 if active_count < config.MAX_ACTIVE_SETUPS_BEFORE_EXPAND else 1
+    group_index = 0
     start = group_index * group_size
     end = start + group_size
     selected_gainers = gainers[start:end]

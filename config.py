@@ -1,0 +1,108 @@
+"""
+AlphaCandle - Isolated Strategy Config
+Fully self-contained. No dependency on any other folder/files on the server.
+
+Fill in your real Dhan credentials and Telegram bot details below before
+running. This folder is completely separate from Ali's original algo folder
+so nothing there is touched or affected.
+"""
+from zoneinfo import ZoneInfo
+
+TIME_ZONE = ZoneInfo("Asia/Kolkata")
+
+# ---------------- DHAN CREDENTIALS ----------------
+CLIENT_ID = "1101392042"
+PIN = "000369"
+TOTP_TOKEN = "KVOIK5HSPDW6DXPJFF3WVJICVDC3QMWR"
+
+# ---------------- TELEGRAM ----------------
+BOT_TOKEN = "8939945606:AAHA_dLTkJDBHDnX1JznDcw3PXqD654rxrE"
+BOT_CHAT_ID = "-5428490798"
+
+# ---------------- SAFETY SWITCH ----------------
+# True  -> NO real Dhan order/modify/cancel call is EVER made. Entries/exits
+#          are fully simulated in-memory using real live prices.
+# False -> Real orders placed. Only flip after verified paper sessions.
+PAPER_MODE = True
+
+# ---------------- BROKER / EXCHANGE ----------------
+EXCHANGE = "NSE_EQ"
+PRODUCT_TYPE = "INTRADAY"
+INDEX_SECURITY_ID = 13          # Nifty 50, IDX_I segment
+
+# ---------------- UNIVERSE ----------------
+FNO_ONLY = True
+MIN_PRICE = 20.0
+MAX_SPREAD_PCT = 0.5
+
+# ---------------- DISCOVERY (Top movers) ----------------
+MIN_PCT_MOVE = 1.0
+MAX_PCT_MOVE = 5.0
+TOP_N_GAINERS = 10
+TOP_N_LOSERS = 10
+DISCOVERY_QUOTE_CHUNK = 45
+DISCOVERY_FULL_SCAN_INTERVAL_SEC = 20
+FINAL_UNIVERSE_LOCK_TIME = (11, 0, 0)
+SCAN_GROUP_SIZE_PER_SIDE = 5
+MAX_ACTIVE_SETUPS_BEFORE_EXPAND = 2
+
+# ---------------- FRESHNESS / STALE-SIGNAL FILTER ----------------
+MAX_ALPHA_AGE_MINUTES = 15
+EXPIRED_ALPHA_COOLDOWN_MINUTES = 360
+
+# ---------------- PATTERN (Alpha Candle) ----------------
+PATTERN_TIMEFRAME = 5           # minutes - trend run + Alpha Candle detection
+ENTRY_TIMEFRAME = 1             # minutes - precise breakout entry + exit mgmt
+MIN_TREND_CANDLES = 3
+DOJI_BODY_RATIO = 0.18          # body/range below this = doji, candle rejected
+HOLD_CANDLES_5MIN = 3           # abandon setup if no breakout within this many 5-min candles' worth of time
+
+# ---------------- RISK / SIZING ----------------
+SL_POINTS_MIN = 2.0
+SL_POINTS_MAX = 3.0
+RISK_PER_TRADE = 200.0
+MAX_LOSS_PER_DAY = 2000.0
+MAX_TRADES_PER_DAY = 5
+MAX_OPEN_POSITIONS = 3
+
+# ---------------- EXIT MANAGEMENT ----------------
+FIRST_TARGET_R_MULTIPLE = 2.0
+PARTIAL_BOOK_FRACTION = 0.5
+STALL_CANDLES_FOR_REVERSAL_EXIT = 3
+
+# ---------------- BLACKLIST ----------------
+BLACKLIST_COOLDOWN_MIN = 60
+BLACKLIST_REQUALIFY_VOL_MULTIPLE = 1.5
+
+# ---------------- TIME WINDOWS ----------------
+START_TIME = (9, 15, 0)          # market opens 9:15 AM
+DISCOVERY_WARMUP_END = (9, 20, 0) # 5 min warmup to build prev_close cache before scanning
+LAST_ENTRY_TIME = (15, 0, 0)      # stop taking new entries at 3:00 PM
+SQUARE_OFF_TIME = (15, 10, 0)     # force-close all open positions at 3:10 PM
+EXIT_TIME = (15, 12, 0)           # engine fully stops at 3:12 PM
+
+COST_TO_COST_AFTER_MAX_LOSS = True
+
+# ---------------- DASHBOARD ----------------
+DASHBOARD_HOST = "0.0.0.0"
+DASHBOARD_PORT = 8787
+
+# ---------------- TELEGRAM TOGGLES ----------------
+SEND_TELEGRAM_ON_SETUP_WATCH = True
+SEND_TELEGRAM_ON_ENTRY = True
+SEND_TELEGRAM_ON_EXIT = True
+SEND_TELEGRAM_ON_LOGIN = True
+SEND_TELEGRAM_HEARTBEAT_MIN = 0
+SEND_TELEGRAM_TOP_MOVERS = True
+TOP_MOVERS_TELEGRAM_TIMES = (
+	(9, 20, 0),
+	(10, 0, 0),
+	(11, 0, 0),
+)
+
+# ---------------- PATHS ----------------
+import os
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+TOKEN_CACHE_DIR = os.path.join(BASE_DIR, "data")
+TOKEN_CACHE_FILE = os.path.join(TOKEN_CACHE_DIR, "dhan_access_token.json")
