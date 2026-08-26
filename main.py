@@ -30,6 +30,26 @@ import notifier
 from broker import DhanBroker
 
 _stop_event = threading.Event()
+_candle_cache = {}
+
+
+def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seconds):
+    key = f"{security_id}_{timeframe}"
+    now = time.time()
+    cached = _candle_cache.get(key)
+    if cached and now - cached["fetched_at"] < ttl_seconds:
+        return cached["data"]
+
+    candles = broker.get_intraday_candles(
+        security_id=security_id,
+        exchange_segment=config.EXCHANGE,
+        instrument_type="EQUITY",
+        from_dt=prev_trade_date,
+        timeframe=timeframe,
+    )
+    if candles is not None and not candles.empty:
+        _candle_cache[key] = {"fetched_at": now, "data": candles}
+    return candles
 
 
 def run_flag():
@@ -131,9 +151,9 @@ def scan_candidate(broker, candidate, prev_trade_date):
             return
 
     try:
-        candles_5m = broker.get_intraday_candles(
-            security_id=security_id, exchange_segment=config.EXCHANGE, instrument_type="EQUITY",
-            from_dt=prev_trade_date, timeframe=config.PATTERN_TIMEFRAME,
+        candles_5m = get_cached_candles(
+            broker=broker, security_id=security_id, prev_trade_date=prev_trade_date,
+            timeframe=config.PATTERN_TIMEFRAME, ttl_seconds=25,
         )
         if candles_5m is None or candles_5m.empty:
             return
@@ -149,6 +169,13 @@ def scan_candidate(broker, candidate, prev_trade_date):
             return
 
         alpha = result["alpha_candle"]
+        alpha_range_pct = ((float(alpha.high) - float(alpha.low)) / float(alpha.close)) * 100
+        if alpha_range_pct > config.MAX_ALPHA_RANGE_PCT:
+            state.add_log(
+                f"{symbol}: Alpha rejected - range {alpha_range_pct:.2f}% "
+                f"exceeds {config.MAX_ALPHA_RANGE_PCT:.2f}%"
+            )
+            return
         direction = "BUY" if is_bullish_setup else "SELL"
         alpha_open_time = alpha.timestamp.to_pydatetime()
         alpha_close_time = alpha_open_time + timedelta(minutes=config.PATTERN_TIMEFRAME)
@@ -210,9 +237,9 @@ def scan_candidate(broker, candidate, prev_trade_date):
         return
 
     try:
-        candles_1m = broker.get_intraday_candles(
-            security_id=security_id, exchange_segment=config.EXCHANGE, instrument_type="EQUITY",
-            from_dt=prev_trade_date, timeframe=config.ENTRY_TIMEFRAME,
+        candles_1m = get_cached_candles(
+            broker=broker, security_id=security_id, prev_trade_date=prev_trade_date,
+            timeframe=config.ENTRY_TIMEFRAME, ttl_seconds=8,
         )
         if candles_1m is None or candles_1m.empty:
             return
@@ -281,6 +308,7 @@ def scan_loop(broker, prev_trade_date):
 
 
 def main():
+    state.reset_daily()
     state.update({"started_at": datetime.now(config.TIME_ZONE).isoformat(), "paper_mode": config.PAPER_MODE})
     state.add_log(f"AlphaCandle starting. PAPER_MODE={config.PAPER_MODE}")
 

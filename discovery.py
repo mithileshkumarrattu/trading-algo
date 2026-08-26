@@ -64,6 +64,17 @@ def run_full_universe_scan(broker, universe_df):
     """
     global _last_full_scan
 
+    now = datetime.now(config.TIME_ZONE)
+    lock_time = now.replace(
+        hour=config.FINAL_UNIVERSE_LOCK_TIME[0],
+        minute=config.FINAL_UNIVERSE_LOCK_TIME[1],
+        second=config.FINAL_UNIVERSE_LOCK_TIME[2],
+        microsecond=0,
+    )
+    snap = state.snapshot()
+    if now >= lock_time and snap.get("final_universe_locked", False):
+        return
+
     id_to_row = {int(r.SECURITY_ID): r for _, r in universe_df.iterrows()}
     sec_ids = list(id_to_row.keys())
     quotes = _fetch_batch_quotes(broker, sec_ids)
@@ -175,6 +186,9 @@ def discovery_loop(broker, universe_df, run_flag_fn):
     run_full_universe_scan(broker, universe_df)
     while run_flag_fn():
         try:
+            snap = state.snapshot()
+            if snap.get("final_universe_locked", False):
+                break
             if time.time() - _last_full_scan > config.DISCOVERY_FULL_SCAN_INTERVAL_SEC:
                 run_full_universe_scan(broker, universe_df)
             else:

@@ -72,6 +72,13 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
     transaction_type = "BUY" if is_bullish_setup else "SELL"
     entry_price = float(entry_candle.close)
     sl_price = pattern.initial_stop_loss(alpha_high, alpha_low, is_bullish_setup)
+    stop_distance_pct = abs(entry_price - sl_price) / entry_price * 100
+    if stop_distance_pct > config.MAX_STOP_DISTANCE_PCT:
+        state.add_log(
+            f"{symbol}: entry rejected - stop distance "
+            f"{stop_distance_pct:.2f}% exceeds {config.MAX_STOP_DISTANCE_PCT:.2f}%"
+        )
+        return None
     qty = calc_quantity(entry_price, sl_price)
     if qty <= 0:
         state.add_log(f"{symbol}: quantity calculation failed, skipping entry")
@@ -259,8 +266,12 @@ def square_off_all(broker):
     snap = state.snapshot()
     for sid, pos in list(snap["open_positions"].items()):
         try:
-            ltp = pos["entry_price"] if config.PAPER_MODE else broker.get_ltp_from_api(config.EXCHANGE, sid)
+            ltp = broker.get_ltp(sid, config.EXCHANGE)
         except Exception:
-            ltp = pos["entry_price"]
-        _close_position(broker, sid, ltp or pos["entry_price"], pos["remaining_qty"], reason="EOD_SQUARE_OFF")
-    state.add_log("EOD square-off complete for all AlphaCandle positions")
+            ltp = None
+        exit_price = float(ltp) if ltp is not None else float(pos["entry_price"])
+        _close_position(
+            broker=broker, security_id=sid, exit_price=exit_price,
+            exit_qty=pos["remaining_qty"], reason="EOD_SQUARE_OFF",
+        )
+    state.add_log("EOD square-off completed")

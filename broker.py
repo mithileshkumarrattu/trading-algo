@@ -43,6 +43,22 @@ from dhan_token_manager import get_valid_access_token
 from notifier import send_telegram
 
 logger = logging.getLogger(__name__)
+_malformed_candle_warned_at = {}
+_candle_retry_after = {}
+
+
+def _reject_candle_response(security_id, timeframe, message):
+    key = f"{security_id}_{timeframe}"
+    now_ts = time()
+    last_warn = _malformed_candle_warned_at.get(key, 0)
+    if now_ts - last_warn >= 60:
+        logger.warning(
+            f"Candle data for {security_id}, timeframe={timeframe} "
+            f"{message}; skipping this symbol for 60 seconds"
+        )
+        _malformed_candle_warned_at[key] = now_ts
+    _candle_retry_after[key] = now_ts + 60
+    return None
 
 
 class SingletonMeta(type):
@@ -273,6 +289,10 @@ class DhanBroker(metaclass=SingletonMeta):
 
     def get_intraday_candles(self, security_id, exchange_segment, instrument_type,
                               from_dt, to_dt=None, timeframe=1, skip_incomplete=True, tz="Asia/Kolkata"):
+        retry_key = f"{security_id}_{timeframe}"
+        if time() < _candle_retry_after.get(retry_key, 0):
+            return None
+
         tzinfo = ZoneInfo(tz)
         from_str = from_dt.strftime("%Y-%m-%d")
         to_dt = to_dt or datetime.now()
@@ -286,22 +306,19 @@ class DhanBroker(metaclass=SingletonMeta):
                 )
                 data = res.get("data")
                 if not data or not isinstance(data, dict):
-                    logger.warning(f"No usable candle data for {security_id} (empty/malformed response)")
-                    return None
+                    return _reject_candle_response(security_id, timeframe, "returned empty or malformed data")
 
                 # Ensure every value is a list (guards against scalar-only responses)
                 if not all(isinstance(value, list) for value in data.values()):
-                    logger.warning(f"Candle data for {security_id} not in expected list format, skipping")
-                    return None
+                    return _reject_candle_response(security_id, timeframe, "is malformed")
 
                 lengths = {len(values) for values in data.values()}
                 if len(lengths) > 1 or (lengths and next(iter(lengths)) == 0):
-                    logger.warning(f"Candle data for {security_id} has inconsistent/empty column lengths, skipping")
-                    return None
+                    return _reject_candle_response(security_id, timeframe, "has inconsistent or empty columns")
 
                 df = pd.DataFrame(data)
                 if df.empty:
-                    return df
+                    return _reject_candle_response(security_id, timeframe, "returned no rows")
                 df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(tz)
                 if skip_incomplete:
                     now = datetime.now(tzinfo)

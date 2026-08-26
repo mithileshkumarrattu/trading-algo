@@ -60,6 +60,13 @@ def is_red(candle) -> bool:
     return candle.close < candle.open
 
 
+def candle_body_ratio(candle) -> float:
+    candle_range = candle.high - candle.low
+    if candle_range <= 0:
+        return 0.0
+    return abs(candle.close - candle.open) / candle_range
+
+
 def find_trend_run_and_alpha(candles_5m, is_bullish_setup):
     """
     Scans a day's worth of 5-min candles (oldest first) looking for a
@@ -133,10 +140,12 @@ def check_1min_breakout(candles_1m_since_alpha, alpha_high, alpha_low, is_bullis
     for i in range(len(candles_1m_since_alpha)):
         c = candles_1m_since_alpha.iloc[i]
         if is_bullish_setup:
-            if c.high > alpha_high and c.close > alpha_high:
+            if c.high > alpha_high and c.close > alpha_high \
+                    and candle_body_ratio(c) >= config.MIN_BREAKOUT_BODY_RATIO:
                 return c
         else:
-            if c.low < alpha_low and c.close < alpha_low:
+            if c.low < alpha_low and c.close < alpha_low \
+                    and candle_body_ratio(c) >= config.MIN_BREAKOUT_BODY_RATIO:
                 return c
     return None
 

@@ -49,6 +49,9 @@ MAX_ACTIVE_SETUPS_BEFORE_EXPAND = 2
 # ---------------- FRESHNESS / STALE-SIGNAL FILTER ----------------
 MAX_ALPHA_AGE_MINUTES = 15
 EXPIRED_ALPHA_COOLDOWN_MINUTES = 360
+MAX_ALPHA_RANGE_PCT = 0.65
+MAX_STOP_DISTANCE_PCT = 0.45
+MIN_BREAKOUT_BODY_RATIO = 0.35
 
 # ---------------- PATTERN (Alpha Candle) ----------------
 PATTERN_TIMEFRAME = 5           # minutes - trend run + Alpha Candle detection
