@@ -921,6 +921,19 @@
 
         <article class="small-card glass">
           <div class="card-header">
+            <h3>JP Detection</h3>
+            <span class="tag watch">Detection Only</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Symbol</th><th>Side</th><th>Stage</th><th>JP Time</th><th>Trigger</th><th>SL</th><th>SMMA Band</th></tr></thead>
+              <tbody id="jpWatchlistTable"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="small-card glass">
+          <div class="card-header">
             <h3>Event Log</h3>
             <span class="tag open">Recent</span>
           </div>
@@ -1008,7 +1021,7 @@
       const tbody = document.getElementById(id);
       if (!tbody) return;
       if (!Array.isArray(rows) || rows.length === 0) {
-        const colspan = id === 'watchlistTable' ? 9 : id === 'positionsTable' ? 6 : 4;
+        const colspan = id === 'watchlistTable' ? 9 : id === 'jpWatchlistTable' ? 7 : id === 'positionsTable' ? 6 : 4;
         tbody.innerHTML = `<tr><td colspan="${colspan}" class="muted" style="padding: 18px; text-align: center;">No data</td></tr>`;
         return;
       }
@@ -1138,12 +1151,23 @@
         fillRows('watchlistTable', watchlist, (r) => `
           <tr><td class="sym-cell">${r.symbol || '—'}</td>
             <td><span class="tag ${r.is_bullish_setup ? 'buy' : 'sell'}">${r.direction || (r.is_bullish_setup ? 'BUY' : 'SELL')}</span></td>
-            <td><span class="tag ${r.stage === 'AWAITING_BREAKOUT' ? 'breakout' : 'watching'}">${(r.stage || 'WATCHING').replace('_', ' ')}</span></td>
+            <td><span class="tag ${r.stage === 'AWAITING_BREAKOUT' ? 'breakout' : 'watching'}">${r.stage === 'AWAITING_BREAKOUT' ? 'AWAITING 1-MIN WICK BREAK' : (r.stage || 'WATCHING').replace('_', ' ')}</span></td>
             <td class="num">${r.alpha_candle_time || '—'}</td>
             <td class="num">${fmt(r.alpha_high)}</td><td class="num">${fmt(r.alpha_low)}</td>
             <td class="num">${fmt(r.current_ltp)}</td>
             <td class="num">${r.distance_to_trigger_pct === null || r.distance_to_trigger_pct === undefined ? '—' : (r.distance_to_trigger_pct >= 0 ? '+' + r.distance_to_trigger_pct + '%' : r.distance_to_trigger_pct + '%')}</td>
             <td class="num">${(() => { const expiresAt = r.hold_expires_at ? new Date(r.hold_expires_at).getTime() : null; const minsLeft = expiresAt ? Math.max(0, Math.round((expiresAt - Date.now()) / 60000)) : '—'; return minsLeft === '—' ? minsLeft : minsLeft + ' min'; })()}</td></tr>
+        `);
+
+        const jpWatchlist = Object.values(s.jp_watchlist || {});
+        fillRows('jpWatchlistTable', jpWatchlist, (r) => `
+          <tr><td class="sym-cell">${r.symbol || '—'}</td>
+            <td><span class="tag ${r.direction === 'BUY' ? 'buy' : 'sell'}">${r.direction || '—'}</span></td>
+            <td><span class="tag watching">${(r.stage || 'WATCHING').replaceAll('_', ' ')}</span></td>
+            <td class="num">${r.jp_open_time || '—'}</td>
+            <td class="num">${fmt(r.trigger_price)}</td>
+            <td class="num negative">${fmt(r.stop_price)}</td>
+            <td class="num">${fmt(r.smma_band_low)} - ${fmt(r.smma_band_high)}</td></tr>
         `);
 
         const positions = Object.values(s.open_positions || {});

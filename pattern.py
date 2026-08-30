@@ -137,16 +137,12 @@ def check_1min_breakout(candles_1m_since_alpha, alpha_high, alpha_low, is_bullis
     if candles_1m_since_alpha is None or candles_1m_since_alpha.empty:
         return None
 
-    for i in range(len(candles_1m_since_alpha)):
-        c = candles_1m_since_alpha.iloc[i]
+    for _, candle in candles_1m_since_alpha.iterrows():
         if is_bullish_setup:
-            if c.high > alpha_high and c.close > alpha_high \
-                    and candle_body_ratio(c) >= config.MIN_BREAKOUT_BODY_RATIO:
-                return c
-        else:
-            if c.low < alpha_low and c.close < alpha_low \
-                    and candle_body_ratio(c) >= config.MIN_BREAKOUT_BODY_RATIO:
-                return c
+            if float(candle["high"]) > float(alpha_high):
+                return candle
+        elif float(candle["low"]) < float(alpha_low):
+            return candle
     return None
 
 

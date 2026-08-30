@@ -53,6 +53,25 @@ MAX_ALPHA_RANGE_PCT = 0.65
 MAX_STOP_DISTANCE_PCT = 0.45
 MIN_BREAKOUT_BODY_RATIO = 0.35
 
+# ---------------- JP (JACKPOT) STRATEGY ----------------
+JP_ENABLED = True
+JP_DETECTION_ONLY = True
+JP_TIMEFRAME = 5
+JP_SMMA_LENGTH = 10
+JP_MAX_CLOSE_THROUGH_BAND_PCT = 0.15
+JP_MAX_STOP_DISTANCE_PCT = 0.60
+JP_MAX_AGE_MINUTES = 10
+
+# ---------------- JP SAFETY / QUIET MODE ----------------
+JP_TOP_N_PER_SIDE = 30
+JP_MAX_SIGNALS_PER_SYMBOL_PER_DAY = 1
+JP_CONFIRMATION_CANDLES = 1
+SEND_TELEGRAM_ON_JP_SETUP = True
+
+ALPHA_ENTRY_WICK_ONLY = True
+ALPHA_1M_CACHE_TTL_SEC = 5
+ALPHA_5M_CACHE_TTL_SEC = 20
+
 # ---------------- PATTERN (Alpha Candle) ----------------
 PATTERN_TIMEFRAME = 5           # minutes - trend run + Alpha Candle detection
 ENTRY_TIMEFRAME = 1             # minutes - precise breakout entry + exit mgmt

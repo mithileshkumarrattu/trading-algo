@@ -18,6 +18,7 @@ from collections import defaultdict
 from decimal import Decimal
 from datetime import datetime, timedelta
 from queue import Queue, Empty
+from typing import Any
 
 import pandas as pd
 
@@ -72,7 +73,7 @@ class SingletonMeta(type):
 
 class DhanBroker(metaclass=SingletonMeta):
     def __init__(self):
-        self.dhan: dhanhq | None = None
+        self.dhan: Any = None
         self.dhan_context = None
         self.liveFeed = {}
         self.orderPool = {}

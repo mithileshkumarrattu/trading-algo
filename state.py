@@ -40,6 +40,9 @@ _DEFAULT_STATE = {
     "last_discovery_scan": None,
     "alerted_alpha_keys": [],  # dedup keys already Telegram-alerted this session
     "expired_alpha_keys": {},  # alpha key -> cooldown expiry timestamp
+    "jp_watchlist": {},
+    "alerted_jp_keys": [],
+    "jp_symbol_signal_counts": {},
     "top_mover_telegram_slots_sent": [],
     "final_universe_locked": False,
     "final_top_gainers": [],
@@ -207,3 +210,44 @@ def mark_alerted(key: str, max_keys: int = 500):
 def reset_daily():
     with _LOCK:
         _write_raw(dict(_DEFAULT_STATE))
+
+
+def set_jp_watchlist_item(security_id, item: dict):
+    with _LOCK:
+        data = _read_raw()
+        data.setdefault("jp_watchlist", {})[str(security_id)] = item
+        _write_raw(data)
+
+
+def remove_jp_watchlist_item(security_id):
+    with _LOCK:
+        data = _read_raw()
+        data.setdefault("jp_watchlist", {}).pop(str(security_id), None)
+        _write_raw(data)
+
+
+def has_alerted_jp(key: str) -> bool:
+    return key in snapshot().get("alerted_jp_keys", [])
+
+
+def mark_jp_alerted(key: str, max_keys: int = 500):
+    with _LOCK:
+        data = _read_raw()
+        keys = data.setdefault("alerted_jp_keys", [])
+        if key not in keys:
+            keys.append(key)
+        data["alerted_jp_keys"] = keys[-max_keys:]
+        _write_raw(data)
+
+
+def jp_signal_count(security_id):
+    return int(snapshot().get("jp_symbol_signal_counts", {}).get(str(security_id), 0))
+
+
+def increment_jp_signal_count(security_id):
+    with _LOCK:
+        data = _read_raw()
+        counts = data.setdefault("jp_symbol_signal_counts", {})
+        key = str(security_id)
+        counts[key] = int(counts.get(key, 0)) + 1
+        _write_raw(data)

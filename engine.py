@@ -94,6 +94,12 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
         order_id = _next_paper_id()
         sl_order_id = _next_paper_id()
         state.add_log(f"[PAPER] {transaction_type} entry simulated: {symbol} qty={qty} @ {entry_price:.2f}")
+        logger.warning(
+            f"PAPER ENTRY CREATED | {transaction_type} | {symbol} | "
+            f"qty={qty} | entry={entry_price:.2f} | sl={sl_price:.2f} | "
+            f"target={target_r2_price:.2f} | alpha={alpha_open_time} | "
+            f"trigger_1m={entry_candle.timestamp}"
+        )
     else:
         limit_price = broker.get_limit_price(config.EXCHANGE, security_id, transaction_type) or entry_price
         order_id = broker.place_order(security_id, transaction_type, config.EXCHANGE, qty,
@@ -109,6 +115,9 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
                                           limit_price=sl_price, trigger_price=sl_price, tick_size=tick_size)
 
     position = {
+        "strategy": "ALPHA",
+        "entry_reason": "1_MIN_WICK_BREAK",
+        "trigger_price_level": float(alpha_high if is_bullish_setup else alpha_low),
         "security_id": str(security_id),
         "symbol": symbol,
         "transaction_type": transaction_type,

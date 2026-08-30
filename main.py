@@ -25,12 +25,14 @@ import timing
 import universe
 import discovery
 import pattern
+import jp_pattern
 import engine
 import notifier
 from broker import DhanBroker
 
 _stop_event = threading.Event()
 _candle_cache = {}
+_processed_alpha_1m_candles = set()
 
 
 def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seconds):
@@ -50,6 +52,66 @@ def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seco
     if candles is not None and not candles.empty:
         _candle_cache[key] = {"fetched_at": now, "data": candles}
     return candles
+
+
+def check_alpha_entry(broker, security_id, symbol, is_bullish_setup,
+                      watchlist_entry, prev_trade_date):
+    alpha_close_time = datetime.fromisoformat(watchlist_entry["alpha_close_time"])
+    hold_expires_at = datetime.fromisoformat(watchlist_entry["hold_expires_at"])
+    now = datetime.now(config.TIME_ZONE)
+    completed_cutoff = now.replace(second=0, microsecond=0)
+    candles_1m = get_cached_candles(
+        broker=broker,
+        security_id=security_id,
+        prev_trade_date=prev_trade_date,
+        timeframe=config.ENTRY_TIMEFRAME,
+        ttl_seconds=config.ALPHA_1M_CACHE_TTL_SEC,
+    )
+    if candles_1m is None or candles_1m.empty:
+        return None
+
+    eligible = candles_1m[
+        (candles_1m["timestamp"] >= alpha_close_time)
+        & (candles_1m["timestamp"] < completed_cutoff)
+        & (candles_1m["timestamp"] <= hold_expires_at)
+    ].copy()
+    if eligible.empty:
+        return None
+
+    alpha_key = watchlist_entry["alpha_key"]
+    for _, candle in eligible.iterrows():
+        candle_time = candle["timestamp"].isoformat()
+        processed_key = f"{alpha_key}_{candle_time}"
+        if processed_key in _processed_alpha_1m_candles:
+            continue
+        _processed_alpha_1m_candles.add(processed_key)
+
+        high = float(candle["high"])
+        low = float(candle["low"])
+        close = float(candle["close"])
+        if is_bullish_setup:
+            triggered = high > float(watchlist_entry["alpha_high"])
+            level = float(watchlist_entry["alpha_high"])
+            trigger_text = "high"
+        else:
+            triggered = low < float(watchlist_entry["alpha_low"])
+            level = float(watchlist_entry["alpha_low"])
+            trigger_text = "low"
+
+        state.add_log(
+            f"{symbol}: Alpha 1-min checked time={candle_time}, high={high:.2f}, "
+            f"low={low:.2f}, close={close:.2f}, required_{trigger_text}={level:.2f}, "
+            f"triggered={triggered}"
+        )
+        if triggered:
+            state.add_log(
+                f"{symbol}: ALPHA WICK ENTRY CONFIRMED "
+                f"direction={'BUY' if is_bullish_setup else 'SELL'}, "
+                f"alpha_time={watchlist_entry['alpha_open_time']}, "
+                f"entry_1m_time={candle_time}, high={high:.2f}, low={low:.2f}, close={close:.2f}"
+            )
+            return candle
+    return None
 
 
 def run_flag():
@@ -133,6 +195,98 @@ def build_scan_candidates():
         f"losers={len(selected_losers)}, active={active_count}"
     )
     return candidates
+
+
+def build_jp_scan_candidates():
+    snap = state.snapshot()
+    now = datetime.now(config.TIME_ZONE).time()
+    use_locked = now >= timing.get_time(config.FINAL_UNIVERSE_LOCK_TIME)
+    gainers = snap.get("final_top_gainers" if use_locked else "top_gainers", [])
+    losers = snap.get("final_top_losers" if use_locked else "top_losers", [])
+    candidates = [
+        {**row, "is_bullish_setup": True}
+        for row in gainers[:config.JP_TOP_N_PER_SIDE]
+    ]
+    candidates.extend(
+        {**row, "is_bullish_setup": False}
+        for row in losers[:config.JP_TOP_N_PER_SIDE]
+    )
+    return candidates
+
+
+def scan_jp_candidate(broker, candidate, prev_trade_date):
+    if not config.JP_ENABLED:
+        return
+
+    security_id = int(candidate["SECURITY_ID"])
+    symbol = candidate["display_name"]
+    is_bullish_setup = candidate["is_bullish_setup"]
+
+    if state.jp_signal_count(security_id) >= config.JP_MAX_SIGNALS_PER_SYMBOL_PER_DAY:
+        return
+    snap = state.snapshot()
+    if str(security_id) in snap.get("open_positions", {}):
+        return
+
+    try:
+        candles_5m = get_cached_candles(
+            broker=broker, security_id=security_id, prev_trade_date=prev_trade_date,
+            timeframe=config.JP_TIMEFRAME, ttl_seconds=25,
+        )
+    except Exception:
+        logger.exception(f"JP 5-min candle fetch failed for {symbol}")
+        return
+    if candles_5m is None or candles_5m.empty:
+        return
+
+    today = datetime.now(config.TIME_ZONE).date()
+    candles_5m = candles_5m[candles_5m["timestamp"].dt.date == today].copy()
+    result = jp_pattern.find_jp_setup(candles_5m, is_bullish_setup)
+    if result is None:
+        return
+
+    now = datetime.now(config.TIME_ZONE)
+    age_minutes = (now - result["jp_close_time"]).total_seconds() / 60.0
+    if result["jp_close_time"] > now or age_minutes > config.JP_MAX_AGE_MINUTES:
+        return
+
+    key = f"JP_{security_id}_{result['direction']}_{result['jp_open_time'].isoformat()}"
+    if state.has_alerted_jp(key):
+        return
+
+    stop_pct = jp_pattern.jp_stop_distance_pct(result["trigger_price"], result["stop_price"])
+    if stop_pct > config.JP_MAX_STOP_DISTANCE_PCT:
+        state.add_log(
+            f"{symbol}: JP rejected; stop distance {stop_pct:.2f}% exceeds "
+            f"{config.JP_MAX_STOP_DISTANCE_PCT:.2f}%"
+        )
+        state.mark_jp_alerted(key)
+        return
+
+    item = {
+        "strategy": "JP", "symbol": symbol, "security_id": str(security_id),
+        "direction": result["direction"], "stage": "AWAITING_NEXT_5M_CONFIRMATION",
+        "jp_open_time": result["jp_open_time"].isoformat(),
+        "jp_close_time": result["jp_close_time"].isoformat(),
+        "trigger_price": result["trigger_price"], "stop_price": result["stop_price"],
+        "smma_band_low": result["band_low"], "smma_band_high": result["band_high"],
+        "stop_distance_pct": round(stop_pct, 3), "detected_at": now.isoformat(),
+        "jp_key": key,
+    }
+    state.set_jp_watchlist_item(security_id, item)
+    state.mark_jp_alerted(key)
+    state.add_log(
+        f"{symbol}: JP {result['direction']} detected at {result['jp_open_time'].isoformat()} "
+        f"trigger={result['trigger_price']:.2f} SL={result['stop_price']:.2f}"
+    )
+    state.increment_jp_signal_count(security_id)
+    if config.SEND_TELEGRAM_ON_JP_SETUP:
+        notifier.notify_jp_candle_detected(
+            symbol=symbol, direction=result["direction"],
+            jp_time=result["jp_open_time"].isoformat(),
+            trigger_price=result["trigger_price"], stop_price=result["stop_price"],
+            band_low=result["band_low"], band_high=result["band_high"],
+        )
 
 
 def scan_candidate(broker, candidate, prev_trade_date):
@@ -229,58 +383,46 @@ def scan_candidate(broker, candidate, prev_trade_date):
         return
 
     alpha_close_time = datetime.fromisoformat(watchlist_entry["alpha_close_time"])
-    if pattern.hold_window_expired(alpha_close_time):
-        state.remove_watchlist_item(security_id)
-        expiry_time = datetime.now(config.TIME_ZONE).isoformat()
-        state.mark_expired_alpha(watchlist_entry["alpha_key"], expires_at=expiry_time)
-        state.add_log(f"{symbol}: Alpha expired without breakout. 5-min candle={watchlist_entry['alpha_open_time']} expired_at={expiry_time}")
-        return
-
-    try:
-        candles_1m = get_cached_candles(
-            broker=broker, security_id=security_id, prev_trade_date=prev_trade_date,
-            timeframe=config.ENTRY_TIMEFRAME, ttl_seconds=8,
-        )
-        if candles_1m is None or candles_1m.empty:
-            return
-        today_1m = candles_1m[candles_1m["timestamp"] >= alpha_close_time].copy()
-    except Exception:
-        logger.exception(f"1-min candle fetch failed for {symbol}")
-        return
-
-    if not today_1m.empty:
-        latest_ltp = float(today_1m.iloc[-1].close)
-        alpha_ref = watchlist_entry["alpha_high"] if is_bullish_setup else watchlist_entry["alpha_low"]
-        dist_pct = round(((alpha_ref - latest_ltp) / latest_ltp) * 100, 3) if is_bullish_setup \
-                   else round(((latest_ltp - alpha_ref) / latest_ltp) * 100, 3)
-        updated_entry = dict(watchlist_entry)
-        updated_entry["current_ltp"] = latest_ltp
-        updated_entry["distance_to_trigger_pct"] = dist_pct
-        state.set_watchlist_item(security_id, updated_entry)
-
-    trigger_candle = pattern.check_1min_breakout(
-        today_1m, watchlist_entry["alpha_high"], watchlist_entry["alpha_low"], is_bullish_setup
+    trigger_candle = check_alpha_entry(
+        broker=broker, security_id=security_id, symbol=symbol,
+        is_bullish_setup=is_bullish_setup,
+        watchlist_entry=watchlist_entry, prev_trade_date=prev_trade_date,
     )
     if trigger_candle is None:
+        if datetime.now(config.TIME_ZONE) > datetime.fromisoformat(watchlist_entry["hold_expires_at"]):
+            state.remove_watchlist_item(security_id)
+            expiry_time = datetime.now(config.TIME_ZONE).isoformat()
+            state.mark_expired_alpha(watchlist_entry["alpha_key"], expires_at=expiry_time)
+            state.add_log(
+                f"{symbol}: Alpha expired after checking all completed 1-min candles. "
+                f"alpha={watchlist_entry['alpha_open_time']}"
+            )
         return
 
-    tick_size = 0.05
-    try:
-        universe_df = state.snapshot()
-    except Exception:
-        pass
+    state.add_log(
+        f"{symbol}: Alpha wick-break confirmed. "
+        f"Direction={'BUY' if is_bullish_setup else 'SELL'} | "
+        f"AlphaHigh={float(watchlist_entry['alpha_high']):.2f} | "
+        f"AlphaLow={float(watchlist_entry['alpha_low']):.2f} | "
+        f"1mTime={trigger_candle.timestamp} | "
+        f"1mOpen={float(trigger_candle.open):.2f} | "
+        f"1mHigh={float(trigger_candle.high):.2f} | "
+        f"1mLow={float(trigger_candle.low):.2f} | "
+        f"1mClose={float(trigger_candle.close):.2f}"
+    )
 
     position = engine.enter_trade(
         broker=broker, security_id=security_id, symbol=symbol,
         is_bullish_setup=is_bullish_setup,
         alpha_high=watchlist_entry["alpha_high"], alpha_low=watchlist_entry["alpha_low"],
-        entry_candle=trigger_candle, tick_size=tick_size,
+        entry_candle=trigger_candle, tick_size=0.05,
         alpha_open_time=watchlist_entry["alpha_open_time"],
         alpha_close_time=watchlist_entry["alpha_close_time"],
         alpha_key=watchlist_entry["alpha_key"],
     )
     if position is not None:
         state.remove_watchlist_item(security_id)
+        state.add_log(f"{symbol}: Alpha watch consumed; paper position {position['order_id']} created")
 
 
 def scan_loop(broker, prev_trade_date):
@@ -290,6 +432,9 @@ def scan_loop(broker, prev_trade_date):
                 candidates = build_scan_candidates()
                 for cand in candidates:
                     scan_candidate(broker, cand, prev_trade_date)
+                    time.sleep(0.2)
+                for cand in build_jp_scan_candidates():
+                    scan_jp_candidate(broker, cand, prev_trade_date)
                     time.sleep(0.2)
 
             for sid in list(state.snapshot()["open_positions"].keys()):

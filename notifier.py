@@ -69,8 +69,22 @@ def notify_alpha_candle_detected(symbol, direction, alpha_time, alpha_high, alph
     send_telegram(
         f"{arrow} <b>{symbol}</b> — Alpha Candle formed ({direction} setup)\n"
         f"Time: {alpha_time} on {timeframe}-min chart ({colour} candle after the trend run)\n"
-        f"Watching for a 1-min candle to close beyond Alpha {level_label} = ₹{level:.2f}\n"
+        f"Watching for a completed 1-min candle wick to break Alpha "
+        f"{level_label} = ₹{level:.2f}\n"
         f"Open your chart at exactly this candle to verify the setup."
+    )
+
+
+def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_price, band_low, band_high):
+    arrow = "🟢" if direction == "BUY" else "🔴"
+    level_name = "JP High" if direction == "BUY" else "JP Low"
+    send_telegram(
+        f"{arrow} <b>{symbol}</b> — JP Pullback setup ({direction})\n"
+        f"JP 5-min candle: {jp_time}\n"
+        f"SMMA band: ₹{band_low:.2f} – ₹{band_high:.2f}\n"
+        f"Waiting for next 5-min candle to close beyond {level_name}: ₹{trigger_price:.2f}\n"
+        f"Structural SL: ₹{stop_price:.2f}\n"
+        f"<i>Detection-only paper validation; no JP order will be placed.</i>"
     )
 
 
