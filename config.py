@@ -11,9 +11,9 @@ from zoneinfo import ZoneInfo
 TIME_ZONE = ZoneInfo("Asia/Kolkata")
 
 # ---------------- DHAN CREDENTIALS ----------------
-CLIENT_ID = "1101392042"
-PIN = "000369"
-TOTP_TOKEN = "KVOIK5HSPDW6DXPJFF3WVJICVDC3QMWR"
+CLIENT_ID = ""
+PIN = ""
+TOTP_TOKEN = ""
 
 # ---------------- TELEGRAM ----------------
 BOT_TOKEN = "8939945606:AAHA_dLTkJDBHDnX1JznDcw3PXqD654rxrE"
