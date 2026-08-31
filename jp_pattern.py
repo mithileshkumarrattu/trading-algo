@@ -1,8 +1,9 @@
 """
-JP (Jackpot) Pattern - 5-minute pullback continuation detector.
+JP (Jackpot) Pattern - pattern-timeframe pullback continuation detector.
 
 This module is intentionally independent from Alpha Candle logic.
 It detects and reports JP candidates only; it does not place orders.
+The market rule is still "pattern candle first, then event-driven execution".
 """
 from __future__ import annotations
 
@@ -122,7 +123,7 @@ def find_jp_setup(candles_5m: pd.DataFrame, is_bullish_setup: bool):
 
 
 def check_jp_confirmation(candles_5m, jp_open_time, trigger_price, is_bullish_setup):
-    """Check only the immediately following completed 5-minute candle."""
+    """Check only the immediately following completed pattern candle."""
     if candles_5m is None or candles_5m.empty:
         return None
     expected_time = jp_open_time + timedelta(minutes=config.JP_TIMEFRAME)

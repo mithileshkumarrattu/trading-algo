@@ -71,7 +71,7 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
 
     transaction_type = "BUY" if is_bullish_setup else "SELL"
     entry_price = float(entry_candle.close)
-    sl_price = pattern.initial_stop_loss(alpha_high, alpha_low, is_bullish_setup)
+    sl_price = pattern.initial_stop_loss(alpha_high, alpha_low, is_bullish_setup, entry_price)
     stop_distance_pct = abs(entry_price - sl_price) / entry_price * 100
     if stop_distance_pct > config.MAX_STOP_DISTANCE_PCT:
         state.add_log(

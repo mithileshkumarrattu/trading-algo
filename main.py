@@ -114,6 +114,104 @@ def check_alpha_entry(broker, security_id, symbol, is_bullish_setup,
     return None
 
 
+def process_new_1m_bar_for_setups(broker, latest_completed_1m_bar):
+    if latest_completed_1m_bar is None:
+        return []
+
+    bar_time = latest_completed_1m_bar.get("timestamp")
+    if bar_time is None:
+        return []
+    if isinstance(bar_time, str):
+        try:
+            bar_time = datetime.fromisoformat(bar_time)
+        except ValueError:
+            return []
+    bar_time_iso = bar_time.isoformat()
+
+    setups = list(state.get_active_alpha_setups()) + list(state.get_active_jp_setups())
+    if not setups:
+        return []
+
+    results = []
+    for setup in setups:
+        if not setup:
+            continue
+        if setup.get("last_processed_1m_time") == bar_time_iso:
+            continue
+
+        strategy = (setup.get("strategy") or "ALPHA").upper()
+        security_id = setup.get("security_id")
+        symbol = setup.get("symbol")
+        direction = setup.get("direction")
+        if direction == "BUY":
+            trigger_level = float(setup.get("alpha_high") or setup.get("jp_high") or 0.0)
+            crossed = float(latest_completed_1m_bar.get("high", 0.0)) > trigger_level
+        elif direction == "SELL":
+            trigger_level = float(setup.get("alpha_low") or setup.get("jp_low") or 0.0)
+            crossed = float(latest_completed_1m_bar.get("low", 0.0)) < trigger_level
+        else:
+            continue
+
+        if not crossed:
+            continue
+
+        detected_at = datetime.now(config.TIME_ZONE)
+        bar_close_at = bar_time + timedelta(minutes=1)
+        delay = (detected_at - bar_close_at).total_seconds()
+
+        if delay > config.MAX_ENTRY_DELAY_SECONDS:
+            state.log_setup_outcome(setup, "SKIPPED_LATE_TRIGGER", f"delay={delay:.1f}s")
+            if strategy == "ALPHA":
+                state.remove_alpha_setup(security_id)
+            else:
+                state.remove_jp_setup(security_id)
+            results.append({"setup": setup, "outcome": "SKIPPED_LATE_TRIGGER", "bar_time": bar_time_iso})
+            continue
+
+        ltp = broker.get_ltp(security_id, config.EXCHANGE)
+        if ltp is None:
+            state.log_setup_outcome(setup, "SKIPPED_NO_LTP", "")
+            if strategy == "ALPHA":
+                state.remove_alpha_setup(security_id)
+            else:
+                state.remove_jp_setup(security_id)
+            results.append({"setup": setup, "outcome": "SKIPPED_NO_LTP", "bar_time": bar_time_iso})
+            continue
+
+        state.mark_alpha_bar_processed(security_id, bar_time_iso)
+        state.mark_jp_bar_processed(security_id, bar_time_iso)
+        setup["last_processed_1m_time"] = bar_time_iso
+        setup["status"] = "TRIGGERED"
+
+        fill = ltp
+        if direction == "BUY":
+            fill = max(fill, float(latest_completed_1m_bar.get("close", ltp)))
+        else:
+            fill = min(fill, float(latest_completed_1m_bar.get("close", ltp)))
+
+        engine.enter_trade(
+            broker=broker,
+            security_id=security_id,
+            symbol=symbol,
+            is_bullish_setup=(direction == "BUY"),
+            alpha_high=float(setup.get("alpha_high") or setup.get("jp_high") or trigger_level),
+            alpha_low=float(setup.get("alpha_low") or setup.get("jp_low") or trigger_level),
+            entry_candle=type("_EntryBar", (), {
+                "open": latest_completed_1m_bar.get("open", fill),
+                "high": latest_completed_1m_bar.get("high", fill),
+                "low": latest_completed_1m_bar.get("low", fill),
+                "close": fill,
+                "timestamp": bar_time,
+            })(),
+            alpha_open_time=setup.get("alpha_open_time") or setup.get("jp_open_time"),
+            alpha_close_time=setup.get("alpha_close_time") or setup.get("jp_close_time"),
+            alpha_key=setup.get("alpha_key") or setup.get("jp_key"),
+        )
+        results.append({"setup": setup, "outcome": "TRIGGERED", "bar_time": bar_time_iso, "ltp": ltp})
+
+    return results
+
+
 def run_flag():
     return timing.is_within_run_window() and not _stop_event.is_set()
 
@@ -234,7 +332,7 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
             timeframe=config.JP_TIMEFRAME, ttl_seconds=25,
         )
     except Exception:
-        logger.exception(f"JP 5-min candle fetch failed for {symbol}")
+        logger.exception(f"JP pattern candle fetch failed for {symbol}")
         return
     if candles_5m is None or candles_5m.empty:
         return
@@ -313,7 +411,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
             return
         today_5m = candles_5m[candles_5m["timestamp"].dt.date == datetime.now(config.TIME_ZONE).date()]
     except Exception:
-        logger.exception(f"5-min candle fetch failed for {symbol}")
+        logger.exception(f"Pattern-timeframe candle fetch failed for {symbol}")
         return
 
     if watchlist_entry is None or watchlist_entry.get("stage") != "AWAITING_BREAKOUT":
@@ -338,7 +436,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
         alpha_key = f"{security_id}_{direction}_{alpha_open_time.isoformat()}"
 
         if alpha_close_time > now:
-            state.add_log(f"{symbol}: Alpha ignored - 5-min candle has not closed yet ({alpha_open_time.isoformat()})")
+            state.add_log(f"{symbol}: Alpha ignored - pattern candle has not closed yet ({alpha_open_time.isoformat()})")
             return
         if alpha_age_minutes > config.MAX_ALPHA_AGE_MINUTES:
             state.add_log(f"{symbol}: stale Alpha ignored - {alpha_age_minutes:.1f} min old, candle={alpha_open_time.isoformat()}")
@@ -429,6 +527,31 @@ def scan_loop(broker, prev_trade_date):
     while run_flag():
         try:
             if timing.is_entry_allowed():
+                active_setups = state.get_active_alpha_setups() + state.get_active_jp_setups()
+                for setup in active_setups:
+                    if not setup:
+                        continue
+                    security_id = int(setup["security_id"])
+                    try:
+                        candles_1m = get_cached_candles(
+                            broker=broker,
+                            security_id=security_id,
+                            prev_trade_date=prev_trade_date,
+                            timeframe=config.ENTRY_TIMEFRAME,
+                            ttl_seconds=max(config.CANDLE_CACHE_TTL_1M_SEC, config.ALPHA_1M_CACHE_TTL_SEC),
+                        )
+                        if candles_1m is None or candles_1m.empty:
+                            continue
+                        now = datetime.now(config.TIME_ZONE)
+                        cutoff = now.replace(second=0, microsecond=0)
+                        completed = candles_1m[(candles_1m["timestamp"] < cutoff)].copy()
+                        if completed.empty:
+                            continue
+                        latest = completed.iloc[-1].to_dict()
+                        process_new_1m_bar_for_setups(broker, latest)
+                    except Exception:
+                        logger.exception(f"1m event processing failed for {setup.get('symbol')}")
+
                 candidates = build_scan_candidates()
                 for cand in candidates:
                     scan_candidate(broker, cand, prev_trade_date)

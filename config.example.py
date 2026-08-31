@@ -56,7 +56,7 @@ MIN_BREAKOUT_BODY_RATIO = 0.35
 # ---------------- JP (JACKPOT) STRATEGY ----------------
 JP_ENABLED = True
 JP_DETECTION_ONLY = True
-JP_TIMEFRAME = 5
+JP_TIMEFRAME = 3
 JP_SMMA_LENGTH = 10
 JP_MAX_CLOSE_THROUGH_BAND_PCT = 0.15
 JP_MAX_STOP_DISTANCE_PCT = 0.60
@@ -73,11 +73,12 @@ ALPHA_1M_CACHE_TTL_SEC = 5
 ALPHA_5M_CACHE_TTL_SEC = 20
 
 # ---------------- PATTERN (Alpha Candle) ----------------
-PATTERN_TIMEFRAME = 5           # minutes - trend run + Alpha Candle detection
+ALPHA_TIMEFRAME = 3
+PATTERN_TIMEFRAME = 3           # minutes - trend run + Alpha Candle detection
 ENTRY_TIMEFRAME = 1             # minutes - precise breakout entry + exit mgmt
 MIN_TREND_CANDLES = 3
 DOJI_BODY_RATIO = 0.18          # body/range below this = doji, candle rejected
-HOLD_CANDLES_5MIN = 3           # abandon setup if no breakout within this many 5-min candles' worth of time
+HOLD_CANDLES_5MIN = 3           # abandon setup if no breakout within this many pattern candles' worth of time
 
 # ---------------- RISK / SIZING ----------------
 SL_POINTS_MIN = 2.0

@@ -666,74 +666,6 @@
     </aside>
 
     <main class="main-panel">
-      <section class="top-grid">
-        <article class="hero-card glass">
-          <div class="hero-header">
-            <h4>Portfolio</h4>
-            <span class="tag watch">Live</span>
-          </div>
-          <div class="hero-title" id="portfolioTitle">Portfolio Snapshot</div>
-          <div class="hero-value positive" id="summaryPnl">₹0.00</div>
-          <div class="subline">
-            <span>Today's Change</span>
-            <strong class="positive" id="summaryChange">+₹0.00</strong>
-          </div>
-          <div class="subline">
-            <span>Portfolio Value</span>
-            <strong id="portfolioValue">₹0.00</strong>
-          </div>
-          <div class="progress"><span id="portfolioProgress" style="width: 0%"></span></div>
-        </article>
-
-        <article class="hero-card glass">
-          <div class="hero-header">
-            <h4>Positions</h4>
-            <span class="tag open">Open</span>
-          </div>
-          <div class="hero-value" id="openCountMain">0</div>
-          <div class="subline">
-            <span>Running</span>
-            <strong class="positive" id="runningPos">0</strong>
-          </div>
-          <div class="subline">
-            <span>Risk</span>
-            <strong id="riskStatusLabel">Normal</strong>
-          </div>
-        </article>
-
-        <article class="hero-card glass">
-          <div class="hero-header">
-            <h4>Nifty 50</h4>
-            <span class="tag watch">Index</span>
-          </div>
-          <div class="hero-value" id="niftyLtp">—</div>
-          <div class="subline">
-            <span>Today's Change</span>
-            <strong id="niftyChange">—</strong>
-          </div>
-          <div class="subline">
-            <span>Regime</span>
-            <strong id="regimeText">UNKNOWN</strong>
-          </div>
-        </article>
-
-        <article class="hero-card glass">
-          <div class="hero-header">
-            <h4>Risk</h4>
-            <span class="tag watch">Active</span>
-          </div>
-          <div class="hero-value" id="riskValue">Normal</div>
-          <div class="subline">
-            <span>Max drawdown</span>
-            <strong>₹2,000</strong>
-          </div>
-          <div class="subline">
-            <span>Trades used</span>
-            <strong id="tradeCount">0 / 5</strong>
-          </div>
-        </article>
-      </section>
-
       <section class="center-grid">
         <article class="stack-card glass">
           <div class="card-header">
@@ -787,7 +719,12 @@
                   <th>Symbol</th>
                   <th>Setup</th>
                   <th>Stage</th>
-                  <th>Trend</th>
+                  <th>Alpha Time</th>
+                  <th>Alpha High</th>
+                  <th>Alpha Low</th>
+                  <th>Current LTP</th>
+                  <th>Dist to Trigger</th>
+                  <th>Expires In</th>
                 </tr>
               </thead>
               <tbody id="watchlistTable"></tbody>
@@ -821,6 +758,29 @@
     <aside class="right-panel glass">
       <div class="stack-card">
         <div class="card-header">
+          <h3>Today's Positions</h3>
+          <span class="tag watch">Live</span>
+        </div>
+        <div class="position-note">Live LTP and unrealized P/L are not persisted by the engine.</div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th>Qty</th>
+                <th>Entry</th>
+                <th>Stop</th>
+                <th>Target</th>
+              </tr>
+            </thead>
+            <tbody id="positionsTable"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="stack-card" style="margin-top: 18px;">
+        <div class="card-header">
           <h3>Notifications</h3>
           <span class="tag open" id="notificationCount">0</span>
         </div>
@@ -833,34 +793,6 @@
           </div>
           <div class="status" style="color: var(--muted); background: rgba(148,163,184,0.12);">Idle</div>
         </div>
-      </div>
-
-      <div class="stack-card" style="margin-top: 18px;">
-        <div class="card-header">
-          <h3>Today's Positions</h3>
-          <span class="tag watch">Live</span>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Symbol</th>
-                <th>Qty</th>
-                <th>PNL</th>
-              </tr>
-            </thead>
-            <tbody id="positionsTable"></tbody>
-          </table>
-        </div>
-      </div>
-
-      <div class="stack-card" style="margin-top: 18px;">
-        <div class="card-header">
-          <h3>Market</h3>
-          <span class="tag watch">Scan</span>
-        </div>
-
-        <div class="market-list" id="marketList"></div>
       </div>
     </aside>
   </div>
@@ -925,71 +857,83 @@
 
         const regime = s.market_regime || 'UNKNOWN';
         const regimePill = document.getElementById('regimePill');
-        document.getElementById('trendTitle').textContent = regime === 'UNKNOWN' ? 'Market Overview' : regime + ' Regime';
-        regimePill.textContent = regime;
-        regimePill.style.background = regime === 'BULLISH' ? 'var(--green-soft)' : regime === 'BEARISH' ? 'var(--red-soft)' : 'var(--slate)';
-        regimePill.style.color = regime === 'BULLISH' ? 'var(--green-strong)' : regime === 'BEARISH' ? 'var(--red)' : 'var(--muted)';
-        document.getElementById('regimeText').textContent = regime;
+        const trendTitle = document.getElementById('trendTitle');
+        if (trendTitle) trendTitle.textContent = regime === 'UNKNOWN' ? 'Market Overview' : regime + ' Regime';
+        if (regimePill) {
+          regimePill.textContent = regime;
+          regimePill.style.background = regime === 'BULLISH' ? 'var(--green-soft)' : regime === 'BEARISH' ? 'var(--red-soft)' : 'var(--slate)';
+          regimePill.style.color = regime === 'BULLISH' ? 'var(--green-strong)' : regime === 'BEARISH' ? 'var(--red)' : 'var(--muted)';
+        }
+        const regimeText = document.getElementById('regimeText');
+        if (regimeText) regimeText.textContent = regime;
 
-        document.getElementById('lowRiskValue').textContent = '—';
-        document.getElementById('exposureValue').textContent = '—';
-        document.getElementById('portfolioTitle').textContent = 'Portfolio Snapshot';
+        const lowRiskValue = document.getElementById('lowRiskValue');
+        if (lowRiskValue) lowRiskValue.textContent = '—';
+        const exposureValue = document.getElementById('exposureValue');
+        if (exposureValue) exposureValue.textContent = '—';
 
         const dailyPnl = Number(s.daily_pnl || 0);
-        document.getElementById('summaryPnl').textContent = money(dailyPnl);
-        document.getElementById('summaryPnl').className = 'hero-value ' + positiveClass(dailyPnl);
-        document.getElementById('dailyPnlMini').textContent = money(dailyPnl);
-        document.getElementById('dailyPnlMini').className = 'value ' + positiveClass(dailyPnl);
-        document.getElementById('summaryChange').textContent = `${dailyPnl >= 0 ? '+' : '-'}${money(Math.abs(dailyPnl))}`;
-        document.getElementById('summaryChange').className = dailyPnl >= 0 ? 'positive' : 'negative';
-
-        const portfolioValue = Number(s.daily_pnl || 0) + 52000;
-        document.getElementById('portfolioValue').textContent = money(portfolioValue, 2);
-        document.getElementById('portfolioProgress').style.width = Math.min(100, ((s.daily_trade_count || 0) / 5) * 100) + '%';
+        const dailyPnlMini = document.getElementById('dailyPnlMini');
+        if (dailyPnlMini) {
+          dailyPnlMini.textContent = money(dailyPnl);
+          dailyPnlMini.className = 'value ' + positiveClass(dailyPnl);
+        }
 
         const openCount = Object.keys(s.open_positions || {}).length;
-        document.getElementById('openCountMini').textContent = String(openCount);
-        document.getElementById('openCountMain').textContent = String(openCount);
-        document.getElementById('runningPos').textContent = String(openCount);
+        const openCountMini = document.getElementById('openCountMini');
+        if (openCountMini) openCountMini.textContent = String(openCount);
 
         const notificationCount = Math.max(0, (s.logs || []).length > 0 ? 1 : 0);
-        document.getElementById('notificationCount').textContent = String(notificationCount);
+        const notificationCountEl = document.getElementById('notificationCount');
+        if (notificationCountEl) notificationCountEl.textContent = String(notificationCount);
         const notificationPanel = document.getElementById('notificationPanel');
-        if (notificationCount === 0) {
-          notificationPanel.innerHTML = `
-            <div class="indicator" style="background: rgba(148,163,184,0.7); box-shadow: none;"></div>
-            <div class="body">
-              <strong>No live notifications</strong>
-              <span>Waiting for execution data</span>
-            </div>
-            <div class="status" style="color: var(--muted); background: rgba(148,163,184,0.12);">Idle</div>
-          `;
-        } else {
-          const latest = (s.logs || []).slice(-1)[0] || 'System active';
-          notificationPanel.innerHTML = `
-            <div class="indicator"></div>
-            <div class="body">
-              <strong>System active</strong>
-              <span>${latest}</span>
-            </div>
-            <div class="status">Live</div>
-          `;
+        if (notificationPanel) {
+          if (notificationCount === 0) {
+            notificationPanel.innerHTML = `
+              <div class="indicator" style="background: rgba(148,163,184,0.7); box-shadow: none;"></div>
+              <div class="body">
+                <strong>No live notifications</strong>
+                <span>Waiting for execution data</span>
+              </div>
+              <div class="status" style="color: var(--muted); background: rgba(148,163,184,0.12);">Idle</div>
+            `;
+          } else {
+            const latest = (s.logs || []).slice(-1)[0] || 'System active';
+            notificationPanel.innerHTML = `
+              <div class="indicator"></div>
+              <div class="body">
+                <strong>System active</strong>
+                <span>${latest}</span>
+              </div>
+              <div class="status">Live</div>
+            `;
+          }
         }
 
         const riskLabel = s.cost_to_cost_mode ? 'Locked' : 'Normal';
-        document.getElementById('riskStatusLabel').textContent = riskLabel;
-        document.getElementById('riskValue').textContent = riskLabel;
-        document.getElementById('riskValue').className = 'hero-value ' + (s.cost_to_cost_mode ? 'negative' : 'positive');
+        const riskStatusLabel = document.getElementById('riskStatusLabel');
+        if (riskStatusLabel) riskStatusLabel.textContent = riskLabel;
+        const riskValue = document.getElementById('riskValue');
+        if (riskValue) {
+          riskValue.textContent = riskLabel;
+          riskValue.className = 'hero-value ' + (s.cost_to_cost_mode ? 'negative' : 'positive');
+        }
 
-        document.getElementById('tradeCount').textContent = `${s.daily_trade_count || 0} / 5`;
+        const tradeCount = document.getElementById('tradeCount');
+        if (tradeCount) tradeCount.textContent = `${s.daily_trade_count || 0} / ${s.max_trades_per_day || '—'}`;
 
         const nifty = Number(s.nifty_ltp || 0);
-        document.getElementById('niftyLtp').textContent = nifty ? money(nifty, 2) : '—';
+        const niftyLtp = document.getElementById('niftyLtp');
+        if (niftyLtp) niftyLtp.textContent = nifty ? money(nifty, 2) : '—';
         const niftyChange = Number(s.nifty_pct_change || 0);
-        document.getElementById('niftyChange').textContent = niftyChange ? `${niftyChange >= 0 ? '+' : ''}${percent(niftyChange, 2)}` : '—';
-        document.getElementById('niftyChange').className = niftyChange >= 0 ? 'positive' : 'negative';
+        const niftyChangeEl = document.getElementById('niftyChange');
+        if (niftyChangeEl) {
+          niftyChangeEl.textContent = niftyChange ? `${niftyChange >= 0 ? '+' : ''}${percent(niftyChange, 2)}` : '—';
+          niftyChangeEl.className = niftyChange >= 0 ? 'positive' : 'negative';
+        }
 
-        document.getElementById('lastUpdated').textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        const updatedEl = document.getElementById('lastUpdated');
+        if (updatedEl) updatedEl.textContent = 'Updated ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
         fillRows('gainersTable', s.top_gainers || [], (r) => `
           <tr>

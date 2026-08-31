@@ -3,7 +3,7 @@ AlphaCandle - Alpha Pattern Detection Engine.
 
 Two-tier logic exactly as specified:
 
-TIER 1 - 5-MIN TIMEFRAME (trend run + Alpha Candle):
+TIER 1 - PATTERN TIMEFRAME (default 3-minute candles for trend run + Alpha Candle):
   BUY setup (stock from Top Gainers list):
     - 3 or more consecutive GREEN candles.
     - Each candle must CLOSE ABOVE the previous candle's HIGH.
@@ -23,11 +23,10 @@ TIER 2 - 1-MIN TIMEFRAME (precise breakout entry):
   BUY: a 1-min candle whose HIGH crosses above Alpha Candle HIGH AND whose
        CLOSE is also above Alpha Candle HIGH -> entry trigger.
   SELL: mirror using Alpha Candle LOW.
-  This is checked continuously across up to HOLD_CANDLES_5MIN * 5 minutes
-  of 1-min candles (i.e. a rolling few-candle hold/lock window). If no 1-min
-  candle qualifies within that budget, the setup is abandoned (dropped from
-  watch) so the scanner can move to a fresher, better setup on another stock
-  rather than get stuck waiting on one.
+  This is checked continuously across the configured hold window in units of
+  the pattern timeframe, with 1-minute bars driving the execution trigger.
+  If no 1-min candle qualifies within that budget, the setup is abandoned so
+  the scanner can move to a fresher setup rather than wait indefinitely.
 
 Nothing here places orders - pure signal detection, handed to engine.py.
 """
@@ -39,6 +38,8 @@ import config
 logger = logging.getLogger(__name__)
 
 # --- Module-level constants (MUST stay at this level, not nested in a func) ---
+PATTERN_TIMEFRAME_MINUTES = int(getattr(config, "PATTERN_TIMEFRAME", 3))
+ENTRY_TIMEFRAME_MINUTES = int(getattr(config, "ENTRY_TIMEFRAME", 1))
 DOJI_BODY_RATIO = getattr(config, "DOJI_BODY_RATIO", 0.18)
 MIN_TREND_CANDLES = getattr(config, "MIN_TREND_CANDLES", 3)
 VOLUME_FLOOR_PCT_OF_AVG = 0.40  # candle must have >= 40% of day's avg volume so far
@@ -69,9 +70,9 @@ def candle_body_ratio(candle) -> float:
 
 def find_trend_run_and_alpha(candles_5m, is_bullish_setup):
     """
-    Scans a day's worth of 5-min candles (oldest first) looking for a
-    qualifying trend run followed immediately by a counter-colour Alpha
-    Candle. Returns None if no complete pattern exists yet in the data.
+    Scans a day's worth of pattern candles (default 3-minute bars) in time order,
+    looking for a qualifying trend run followed immediately by a counter-colour
+    Alpha Candle. Returns None if no complete pattern exists yet in the data.
     """
     if candles_5m is None or len(candles_5m) < MIN_TREND_CANDLES + 1:
         return None
@@ -129,7 +130,7 @@ def find_trend_run_and_alpha(candles_5m, is_bullish_setup):
 
 def check_1min_breakout(candles_1m_since_alpha, alpha_high, alpha_low, is_bullish_setup):
     """
-    candles_1m_since_alpha: 1-min candles AFTER the Alpha Candle's 5-min bar
+    candles_1m_since_alpha: 1-min candles AFTER the Alpha Candle's pattern bar
     closed, oldest first.
 
     Returns the triggering 1-min candle (Series) once found, else None.
@@ -147,10 +148,18 @@ def check_1min_breakout(candles_1m_since_alpha, alpha_high, alpha_low, is_bullis
 
 
 def hold_window_expired(alpha_detected_at) -> bool:
-    budget = timedelta(minutes=config.HOLD_CANDLES_5MIN * config.PATTERN_TIMEFRAME)
+    hold_candles = int(getattr(config, "HOLD_CANDLES_5MIN", 3))
+    pattern_minutes = int(getattr(config, "PATTERN_TIMEFRAME", PATTERN_TIMEFRAME_MINUTES))
+    budget = timedelta(minutes=hold_candles * pattern_minutes)
     return datetime.now(config.TIME_ZONE) > (alpha_detected_at + budget)
 
 
-def initial_stop_loss(alpha_high, alpha_low, is_bullish_setup) -> float:
-    offset = (config.SL_POINTS_MIN + config.SL_POINTS_MAX) / 2.0
-    return (alpha_low - offset) if is_bullish_setup else (alpha_high + offset)
+def initial_stop_loss(alpha_high, alpha_low, is_bullish_setup, entry_price=None) -> float:
+    if entry_price is None:
+        entry_price = alpha_high if is_bullish_setup else alpha_low
+    entry_price = float(entry_price)
+    buffer_points = max(
+        entry_price * (getattr(config, "STOP_BUFFER_PCT", 0.10) / 100.0),
+        getattr(config, "STOP_BUFFER_MIN_POINTS", 0.05),
+    )
+    return (float(alpha_low) - buffer_points) if is_bullish_setup else (float(alpha_high) + buffer_points)

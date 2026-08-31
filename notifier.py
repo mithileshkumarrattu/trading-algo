@@ -80,9 +80,9 @@ def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_pr
     level_name = "JP High" if direction == "BUY" else "JP Low"
     send_telegram(
         f"{arrow} <b>{symbol}</b> — JP Pullback setup ({direction})\n"
-        f"JP 5-min candle: {jp_time}\n"
+        f"JP pattern candle: {jp_time}\n"
         f"SMMA band: ₹{band_low:.2f} – ₹{band_high:.2f}\n"
-        f"Waiting for next 5-min candle to close beyond {level_name}: ₹{trigger_price:.2f}\n"
+        f"Waiting for the next 1-minute execution candle to cross {level_name}: ₹{trigger_price:.2f}\n"
         f"Structural SL: ₹{stop_price:.2f}\n"
         f"<i>Detection-only paper validation; no JP order will be placed.</i>"
     )
@@ -99,7 +99,7 @@ def notify_entry(symbol, direction, qty, entry_price, sl_price, target_price, pa
     alpha_level = alpha_high if direction == "BUY" else alpha_low
     details = []
     if alpha_open_time:
-        details.append(f"Alpha 5-min candle: {alpha_open_time}")
+        details.append(f"Alpha pattern candle: {alpha_open_time}")
     if alpha_level is not None:
         details.append(f"{alpha_level_name}: ₹{float(alpha_level):.2f}")
     if trigger_1m_time:

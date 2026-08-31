@@ -29,7 +29,11 @@ _DEFAULT_STATE = {
     "universe_size": 0,
     "top_gainers": [],
     "top_losers": [],
-    "watchlist": {},          # security_id (str) -> dict with full detail
+    "watchlist": {},          # legacy alpha watchlist compatibility
+    "alpha_watchlist": {},    # security_id (str) -> Alpha setup dict
+    "jp_watchlist": {},       # security_id (str) -> JP setup dict
+    "processed_1m_bars": {}, # security_id -> latest processed 1m bar ISO time
+    "setup_outcomes": [],     # list of {security_id, strategy, outcome, ...}
     "open_positions": {},     # security_id (str) -> dict
     "closed_trades": [],
     "daily_pnl": 0.0,
@@ -40,7 +44,6 @@ _DEFAULT_STATE = {
     "last_discovery_scan": None,
     "alerted_alpha_keys": [],  # dedup keys already Telegram-alerted this session
     "expired_alpha_keys": {},  # alpha key -> cooldown expiry timestamp
-    "jp_watchlist": {},
     "alerted_jp_keys": [],
     "jp_symbol_signal_counts": {},
     "top_mover_telegram_slots_sent": [],
@@ -99,15 +102,49 @@ def add_log(message: str, max_logs: int = 200):
 def set_watchlist_item(security_id, item: dict):
     with _LOCK:
         data = _read_raw()
-        data["watchlist"][str(security_id)] = item
+        sid = str(security_id)
+        data.setdefault("watchlist", {})[sid] = item
+        if item.get("strategy") == "ALPHA" or "alpha_key" in item or "alpha_high" in item:
+            data.setdefault("alpha_watchlist", {})[sid] = item
         _write_raw(data)
 
 
 def remove_watchlist_item(security_id):
     with _LOCK:
         data = _read_raw()
-        data["watchlist"].pop(str(security_id), None)
+        sid = str(security_id)
+        data.setdefault("watchlist", {}).pop(sid, None)
+        data.setdefault("alpha_watchlist", {}).pop(sid, None)
         _write_raw(data)
+
+
+def set_alpha_watchlist_item(security_id, item: dict):
+    with _LOCK:
+        data = _read_raw()
+        sid = str(security_id)
+        data.setdefault("alpha_watchlist", {})[sid] = item
+        data.setdefault("watchlist", {})[sid] = item
+        _write_raw(data)
+
+
+def remove_alpha_watchlist_item(security_id):
+    with _LOCK:
+        data = _read_raw()
+        sid = str(security_id)
+        data.setdefault("alpha_watchlist", {}).pop(sid, None)
+        data.setdefault("watchlist", {}).pop(sid, None)
+        _write_raw(data)
+
+
+def get_active_alpha_setups():
+    data = snapshot()
+    alpha = data.get("alpha_watchlist") or data.get("watchlist") or {}
+    return list(alpha.values())
+
+
+def get_active_jp_setups():
+    data = snapshot()
+    return list((data.get("jp_watchlist") or {}).values())
 
 
 def set_open_position(security_id, item: dict):
@@ -215,15 +252,56 @@ def reset_daily():
 def set_jp_watchlist_item(security_id, item: dict):
     with _LOCK:
         data = _read_raw()
-        data.setdefault("jp_watchlist", {})[str(security_id)] = item
+        sid = str(security_id)
+        data.setdefault("jp_watchlist", {})[sid] = item
         _write_raw(data)
 
 
 def remove_jp_watchlist_item(security_id):
     with _LOCK:
         data = _read_raw()
-        data.setdefault("jp_watchlist", {}).pop(str(security_id), None)
+        sid = str(security_id)
+        data.setdefault("jp_watchlist", {}).pop(sid, None)
         _write_raw(data)
+
+
+def mark_alpha_bar_processed(security_id, bar_time_iso: str):
+    with _LOCK:
+        data = _read_raw()
+        data.setdefault("processed_1m_bars", {})[str(security_id)] = bar_time_iso
+        _write_raw(data)
+
+
+def mark_jp_bar_processed(security_id, bar_time_iso: str):
+    with _LOCK:
+        data = _read_raw()
+        data.setdefault("processed_1m_bars", {})[str(security_id)] = bar_time_iso
+        _write_raw(data)
+
+
+def log_setup_outcome(setup: dict, outcome: str, details: str = ""):
+    with _LOCK:
+        data = _read_raw()
+        payload = {
+            "security_id": str(setup.get("security_id")),
+            "strategy": setup.get("strategy"),
+            "symbol": setup.get("symbol"),
+            "direction": setup.get("direction"),
+            "outcome": outcome,
+            "details": details,
+            "timestamp": datetime.now(config.TIME_ZONE).isoformat(),
+        }
+        data.setdefault("setup_outcomes", []).append(payload)
+        data["setup_outcomes"] = data["setup_outcomes"][-200:]
+        _write_raw(data)
+
+
+def remove_alpha_setup(security_id):
+    remove_alpha_watchlist_item(security_id)
+
+
+def remove_jp_setup(security_id):
+    remove_jp_watchlist_item(security_id)
 
 
 def has_alerted_jp(key: str) -> bool:
