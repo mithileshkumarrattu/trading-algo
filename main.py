@@ -114,102 +114,113 @@ def check_alpha_entry(broker, security_id, symbol, is_bullish_setup,
     return None
 
 
-def process_new_1m_bar_for_setups(broker, latest_completed_1m_bar):
-    if latest_completed_1m_bar is None:
-        return []
+def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
+    """
+    Process exactly one completed 1-minute bar for exactly one matching setup.
+    Never use one symbol's candle to trigger another symbol's setup.
+    """
+    if not setup or latest_completed_1m_bar is None:
+        return None
+
+    security_id = str(setup.get("security_id"))
+    if not security_id:
+        return None
 
     bar_time = latest_completed_1m_bar.get("timestamp")
     if bar_time is None:
-        return []
+        return None
+
     if isinstance(bar_time, str):
         try:
             bar_time = datetime.fromisoformat(bar_time)
         except ValueError:
-            return []
+            return None
+
     bar_time_iso = bar_time.isoformat()
+    if setup.get("last_processed_1m_time") == bar_time_iso:
+        return None
 
-    setups = list(state.get_active_alpha_setups()) + list(state.get_active_jp_setups())
-    if not setups:
-        return []
+    if security_id in state.snapshot().get("open_positions", {}):
+        return None
 
-    results = []
-    for setup in setups:
-        if not setup:
-            continue
-        if setup.get("last_processed_1m_time") == bar_time_iso:
-            continue
+    strategy = (setup.get("strategy") or "ALPHA").upper()
+    symbol = setup.get("symbol", security_id)
+    direction = (setup.get("direction") or "").upper()
+    if direction not in ("BUY", "SELL"):
+        return None
 
-        strategy = (setup.get("strategy") or "ALPHA").upper()
-        security_id = setup.get("security_id")
-        symbol = setup.get("symbol")
-        direction = setup.get("direction")
-        if direction == "BUY":
-            trigger_level = float(setup.get("alpha_high") or setup.get("jp_high") or 0.0)
-            crossed = float(latest_completed_1m_bar.get("high", 0.0)) > trigger_level
-        elif direction == "SELL":
-            trigger_level = float(setup.get("alpha_low") or setup.get("jp_low") or 0.0)
-            crossed = float(latest_completed_1m_bar.get("low", 0.0)) < trigger_level
+    high = float(latest_completed_1m_bar.get("high", 0.0))
+    low = float(latest_completed_1m_bar.get("low", 0.0))
+    close = float(latest_completed_1m_bar.get("close", 0.0))
+
+    trigger_level = float(
+        setup.get("alpha_high" if direction == "BUY" else "alpha_low")
+        or setup.get("jp_high" if direction == "BUY" else "jp_low")
+        or 0.0
+    )
+    if trigger_level <= 0:
+        return None
+
+    crossed = high > trigger_level if direction == "BUY" else low < trigger_level
+    setup["last_processed_1m_time"] = bar_time_iso
+    if strategy == "JP":
+        state.set_jp_watchlist_item(security_id, setup)
+    else:
+        state.set_alpha_watchlist_item(security_id, setup)
+
+    if not crossed:
+        return None
+
+    now = datetime.now(config.TIME_ZONE)
+    bar_close_at = bar_time + timedelta(minutes=1)
+    delay_seconds = (now - bar_close_at).total_seconds()
+
+    if delay_seconds > config.MAX_ENTRY_DELAY_SECONDS:
+        state.log_setup_outcome(setup, "SKIPPED_LATE_TRIGGER", f"delay={delay_seconds:.1f}s")
+        if strategy == "JP":
+            state.remove_jp_setup(security_id)
         else:
-            continue
+            state.remove_alpha_setup(security_id)
+        return "SKIPPED_LATE_TRIGGER"
 
-        if not crossed:
-            continue
-
-        detected_at = datetime.now(config.TIME_ZONE)
-        bar_close_at = bar_time + timedelta(minutes=1)
-        delay = (detected_at - bar_close_at).total_seconds()
-
-        if delay > config.MAX_ENTRY_DELAY_SECONDS:
-            state.log_setup_outcome(setup, "SKIPPED_LATE_TRIGGER", f"delay={delay:.1f}s")
-            if strategy == "ALPHA":
-                state.remove_alpha_setup(security_id)
-            else:
-                state.remove_jp_setup(security_id)
-            results.append({"setup": setup, "outcome": "SKIPPED_LATE_TRIGGER", "bar_time": bar_time_iso})
-            continue
-
-        ltp = broker.get_ltp(security_id, config.EXCHANGE)
-        if ltp is None:
-            state.log_setup_outcome(setup, "SKIPPED_NO_LTP", "")
-            if strategy == "ALPHA":
-                state.remove_alpha_setup(security_id)
-            else:
-                state.remove_jp_setup(security_id)
-            results.append({"setup": setup, "outcome": "SKIPPED_NO_LTP", "bar_time": bar_time_iso})
-            continue
-
-        state.mark_alpha_bar_processed(security_id, bar_time_iso)
-        state.mark_jp_bar_processed(security_id, bar_time_iso)
-        setup["last_processed_1m_time"] = bar_time_iso
-        setup["status"] = "TRIGGERED"
-
-        fill = ltp
-        if direction == "BUY":
-            fill = max(fill, float(latest_completed_1m_bar.get("close", ltp)))
+    ltp = broker.get_ltp(security_id, config.EXCHANGE)
+    if ltp is None:
+        state.log_setup_outcome(setup, "SKIPPED_NO_LTP", "")
+        if strategy == "JP":
+            state.remove_jp_setup(security_id)
         else:
-            fill = min(fill, float(latest_completed_1m_bar.get("close", ltp)))
+            state.remove_alpha_setup(security_id)
+        return "SKIPPED_NO_LTP"
 
-        engine.enter_trade(
-            broker=broker,
-            security_id=security_id,
-            symbol=symbol,
-            is_bullish_setup=(direction == "BUY"),
-            alpha_high=float(setup.get("alpha_high") or setup.get("jp_high") or trigger_level),
-            alpha_low=float(setup.get("alpha_low") or setup.get("jp_low") or trigger_level),
-            entry_candle=type("_EntryBar", (), {
-                "open": latest_completed_1m_bar.get("open", fill),
-                "high": latest_completed_1m_bar.get("high", fill),
-                "low": latest_completed_1m_bar.get("low", fill),
-                "close": fill,
-                "timestamp": bar_time,
-            })(),
-            alpha_open_time=setup.get("alpha_open_time") or setup.get("jp_open_time"),
-            alpha_close_time=setup.get("alpha_close_time") or setup.get("jp_close_time"),
-            alpha_key=setup.get("alpha_key") or setup.get("jp_key"),
-        )
-        results.append({"setup": setup, "outcome": "TRIGGERED", "bar_time": bar_time_iso, "ltp": ltp})
+    fill = max(float(ltp), close) if direction == "BUY" else min(float(ltp), close)
 
-    return results
+    position = engine.enter_trade(
+        broker=broker,
+        security_id=int(security_id),
+        symbol=symbol,
+        is_bullish_setup=(direction == "BUY"),
+        alpha_high=float(setup.get("alpha_high") or setup.get("jp_high") or trigger_level),
+        alpha_low=float(setup.get("alpha_low") or setup.get("jp_low") or trigger_level),
+        entry_candle=type("_EntryBar", (), {
+            "open": float(latest_completed_1m_bar.get("open", fill)),
+            "high": high,
+            "low": low,
+            "close": fill,
+            "timestamp": bar_time,
+        })(),
+        alpha_open_time=setup.get("alpha_open_time") or setup.get("jp_open_time"),
+        alpha_close_time=setup.get("alpha_close_time") or setup.get("jp_close_time"),
+        alpha_key=setup.get("alpha_key") or setup.get("jp_key"),
+    )
+
+    if position is not None:
+        state.log_setup_outcome(setup, "TRADE_ENTERED", f"fill={fill:.2f}")
+        state.remove_alpha_setup(security_id)
+        state.remove_jp_setup(security_id)
+        return "TRADE_ENTERED"
+
+    state.log_setup_outcome(setup, "ENTRY_REJECTED", "")
+    return "ENTRY_REJECTED"
 
 
 def run_flag():
@@ -273,43 +284,20 @@ def heartbeat_loop():
 
 def build_scan_candidates():
     snap = state.snapshot()
-    now = datetime.now(config.TIME_ZONE).time()
-    lock_time = timing.get_time(config.FINAL_UNIVERSE_LOCK_TIME)
-    use_locked = now >= lock_time
-    gainers = snap.get("final_top_gainers" if use_locked else "top_gainers", [])
-    losers = snap.get("final_top_losers" if use_locked else "top_losers", [])
-    active_count = len(snap.get("watchlist", {})) + len(snap.get("open_positions", {}))
-    group_size = config.SCAN_GROUP_SIZE_PER_SIDE
-    group_index = 0
-    start = group_index * group_size
-    end = start + group_size
-    selected_gainers = gainers[start:end]
-    selected_losers = losers[start:end]
-    candidates = [{**row, "is_bullish_setup": True} for row in selected_gainers]
-    candidates.extend({**row, "is_bullish_setup": False} for row in selected_losers)
+    gainers = [{**item, "is_bullish_setup": True} for item in snap.get("top_gainers", [])[:config.TOP_N_GAINERS]]
+    losers = [{**item, "is_bullish_setup": False} for item in snap.get("top_losers", [])[:config.TOP_N_LOSERS]]
+    candidates = gainers + losers
     state.add_log(
-        f"Scan universe: {'FINAL LOCKED' if use_locked else 'LIVE'} "
-        f"group={group_index + 1}, gainers={len(selected_gainers)}, "
-        f"losers={len(selected_losers)}, active={active_count}"
+        f"Scan universe: LIVE, gainers={len(gainers)}, losers={len(losers)}, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
     )
     return candidates
 
 
 def build_jp_scan_candidates():
     snap = state.snapshot()
-    now = datetime.now(config.TIME_ZONE).time()
-    use_locked = now >= timing.get_time(config.FINAL_UNIVERSE_LOCK_TIME)
-    gainers = snap.get("final_top_gainers" if use_locked else "top_gainers", [])
-    losers = snap.get("final_top_losers" if use_locked else "top_losers", [])
-    candidates = [
-        {**row, "is_bullish_setup": True}
-        for row in gainers[:config.JP_TOP_N_PER_SIDE]
-    ]
-    candidates.extend(
-        {**row, "is_bullish_setup": False}
-        for row in losers[:config.JP_TOP_N_PER_SIDE]
-    )
-    return candidates
+    gainers = [{**row, "is_bullish_setup": True} for row in snap.get("top_gainers", [])[:config.JP_TOP_N_PER_SIDE]]
+    losers = [{**row, "is_bullish_setup": False} for row in snap.get("top_losers", [])[:config.JP_TOP_N_PER_SIDE]]
+    return gainers + losers
 
 
 def scan_jp_candidate(broker, candidate, prev_trade_date):
@@ -528,14 +516,18 @@ def scan_loop(broker, prev_trade_date):
         try:
             if timing.is_entry_allowed():
                 active_setups = state.get_active_alpha_setups() + state.get_active_jp_setups()
+                setups_by_security = {}
                 for setup in active_setups:
-                    if not setup:
+                    if not setup or not setup.get("security_id"):
                         continue
-                    security_id = int(setup["security_id"])
+                    sid = str(setup["security_id"])
+                    setups_by_security.setdefault(sid, []).append(setup)
+
+                for sid, symbol_setups in setups_by_security.items():
                     try:
                         candles_1m = get_cached_candles(
                             broker=broker,
-                            security_id=security_id,
+                            security_id=int(sid),
                             prev_trade_date=prev_trade_date,
                             timeframe=config.ENTRY_TIMEFRAME,
                             ttl_seconds=max(config.CANDLE_CACHE_TTL_1M_SEC, config.ALPHA_1M_CACHE_TTL_SEC),
@@ -548,9 +540,10 @@ def scan_loop(broker, prev_trade_date):
                         if completed.empty:
                             continue
                         latest = completed.iloc[-1].to_dict()
-                        process_new_1m_bar_for_setups(broker, latest)
+                        for setup in symbol_setups:
+                            process_new_1m_bar_for_setup(broker, setup, latest)
                     except Exception:
-                        logger.exception(f"1m event processing failed for {setup.get('symbol')}")
+                        logger.exception(f"1m event processing failed for {symbol_setups[0].get('symbol', sid)}")
 
                 candidates = build_scan_candidates()
                 for cand in candidates:

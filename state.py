@@ -47,6 +47,7 @@ _DEFAULT_STATE = {
     "alerted_jp_keys": [],
     "jp_symbol_signal_counts": {},
     "top_mover_telegram_slots_sent": [],
+    "last_top_movers_telegram_at": None,
     "final_universe_locked": False,
     "final_top_gainers": [],
     "final_top_losers": [],

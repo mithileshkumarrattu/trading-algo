@@ -27,10 +27,18 @@ _last_full_scan = 0.0
 
 def _scheduled_mover_message_due():
     now = datetime.now(config.TIME_ZONE)
-    today = now.date().isoformat()
     snap = state.snapshot()
-    sent = set(snap.get("top_mover_telegram_slots_sent", []))
+    last_sent = snap.get("last_top_movers_telegram_at")
+    if last_sent:
+        try:
+            last_dt = datetime.fromisoformat(last_sent)
+            if (now - last_dt).total_seconds() < 3600:
+                return False
+        except ValueError:
+            pass
 
+    today = now.date().isoformat()
+    sent = set(snap.get("top_mover_telegram_slots_sent", []))
     for hour, minute, second in config.TOP_MOVERS_TELEGRAM_TIMES:
         slot_name = f"{today}_{hour:02d}{minute:02d}"
         slot_time = now.replace(hour=hour, minute=minute, second=second, microsecond=0)
@@ -38,7 +46,7 @@ def _scheduled_mover_message_due():
             sent.add(slot_name)
             state.update({"top_mover_telegram_slots_sent": sorted(sent)})
             return True
-    return False
+    return not last_sent
 
 
 def _fetch_batch_quotes(broker, security_ids):
@@ -134,7 +142,7 @@ def run_full_universe_scan(broker, universe_df):
             "final_universe_locked_at": now.isoformat(),
         })
         state.add_log(
-            f"Final 11:00 universe locked: {len(gainers[:config.TOP_N_GAINERS])} "
+            f"Final 14:45 universe locked: {len(gainers[:config.TOP_N_GAINERS])} "
             f"gainers / {len(losers[:config.TOP_N_LOSERS])} losers"
         )
     _last_full_scan = time.time()
@@ -145,6 +153,7 @@ def run_full_universe_scan(broker, universe_df):
 
     if config.SEND_TELEGRAM_TOP_MOVERS and _scheduled_mover_message_due():
         notifier.notify_top_movers(gainers, losers)
+        state.update({"last_top_movers_telegram_at": now.isoformat()})
 
 
 def refresh_from_livefeed(broker, universe_df):
