@@ -68,13 +68,13 @@ def _is_downtrend(df: pd.DataFrame, index: int) -> bool:
     )
 
 
-def find_jp_setup(candles_5m: pd.DataFrame, is_bullish_setup: bool):
+def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool):
     """Return the most recent fresh JP pullback candidate, if any."""
     required = config.JP_SMMA_LENGTH + 3
-    if candles_5m is None or len(candles_5m) < required:
+    if pattern_candles is None or len(pattern_candles) < required:
         return None
 
-    df = candles_5m.copy().reset_index(drop=True)
+    df = pattern_candles.copy().reset_index(drop=True)
     df["jp_smma_high"] = smma(df["high"], config.JP_SMMA_LENGTH)
     df["jp_smma_close"] = smma(df["close"], config.JP_SMMA_LENGTH)
     df = df.dropna(subset=["jp_smma_high", "jp_smma_close"]).reset_index(drop=True)
@@ -112,6 +112,10 @@ def find_jp_setup(candles_5m: pd.DataFrame, is_bullish_setup: bool):
         "jp_index": jp_index,
         "jp_open_time": candle_open_time,
         "jp_close_time": candle_close_time,
+        "pattern_open_time": candle_open_time,
+        "pattern_close_time": candle_close_time,
+        "pattern_high": float(candle.high),
+        "pattern_low": float(candle.low),
         "smma_high": float(candle.jp_smma_high),
         "smma_close": float(candle.jp_smma_close),
         "band_low": band_low,
@@ -122,12 +126,12 @@ def find_jp_setup(candles_5m: pd.DataFrame, is_bullish_setup: bool):
     }
 
 
-def check_jp_confirmation(candles_5m, jp_open_time, trigger_price, is_bullish_setup):
+def check_jp_confirmation(pattern_candles, jp_open_time, trigger_price, is_bullish_setup):
     """Check only the immediately following completed pattern candle."""
-    if candles_5m is None or candles_5m.empty:
+    if pattern_candles is None or pattern_candles.empty:
         return None
     expected_time = jp_open_time + timedelta(minutes=config.JP_TIMEFRAME)
-    next_candle = candles_5m[candles_5m["timestamp"] == expected_time]
+    next_candle = pattern_candles[pattern_candles["timestamp"] == expected_time]
     if next_candle.empty:
         return None
     candle = next_candle.iloc[0]

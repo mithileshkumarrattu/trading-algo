@@ -48,6 +48,21 @@ _malformed_candle_warned_at = {}
 _candle_retry_after = {}
 
 
+class RequestPacer:
+    def __init__(self, min_interval_sec: float):
+        self.min_interval_sec = float(min_interval_sec)
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self):
+        with self._lock:
+            now = time()
+            delay = max(0.0, self._next_allowed - now)
+            self._next_allowed = max(now, self._next_allowed) + self.min_interval_sec
+        if delay:
+            sleep(delay)
+
+
 def _reject_candle_response(security_id, timeframe, message):
     key = f"{security_id}_{timeframe}"
     now_ts = time()
@@ -84,19 +99,35 @@ class DhanBroker(metaclass=SingletonMeta):
         self.data_queue = Queue()
         self.cmd_queue = Queue()
         self.stop_event = threading.Event()
+        self.quote_pacer = RequestPacer(1.0 / config.QUOTE_API_MAX_REQUESTS_PER_SECOND)
+        self.data_pacer = RequestPacer(1.0 / config.DATA_API_MAX_REQUESTS_PER_SECOND)
+        self.rate_limited_until = 0.0
         self.start = time()
         self.login()
 
+    def _wait_for_api(self, pacer):
+        cooldown = max(0.0, self.rate_limited_until - time())
+        if cooldown:
+            sleep(cooldown)
+        pacer.wait()
+
+    def _mark_rate_limited(self):
+        current = max(config.RATE_LIMIT_BACKOFF_SEC, self.rate_limited_until - time())
+        backoff = min(current * 2 if current else config.RATE_LIMIT_BACKOFF_SEC,
+                      config.RATE_LIMIT_MAX_BACKOFF_SEC)
+        self.rate_limited_until = time() + backoff
+
     def login(self):
         accessToken = get_valid_access_token()
-        self.accessToken = accessToken
-        if DhanSDK_LEGACY:
-            self.dhan_context = DhanContext(config.CLIENT_ID, accessToken)
-            self.dhan = dhanhq(self.dhan_context)
-        else:
-            self.dhan_context = {"client_id": str(config.CLIENT_ID), "access_token": accessToken}
-            self.dhan = dhanhq(str(config.CLIENT_ID), accessToken)
+        self._configure_api_client(accessToken)
         fundRes = self.dhan.get_fund_limits()
+        if self._is_auth_failure(fundRes):
+            logger.warning("Cached Dhan token rejected; requesting a fresh access token")
+            try:
+                self._configure_api_client(get_valid_access_token(force_refresh=True))
+                fundRes = self.dhan.get_fund_limits()
+            except Exception:
+                logger.exception("Dhan access-token refresh failed during login")
         if fundRes is not None and fundRes.get("status") == "success":
             bal = fundRes["data"].get("availabelBalance")
             logger.info(f"Available Margin: {bal}")
@@ -106,6 +137,22 @@ class DhanBroker(metaclass=SingletonMeta):
             logger.error(f"Login failed: {fundRes}")
             if config.SEND_TELEGRAM_ON_LOGIN:
                 send_telegram("AlphaCandle login FAILED. Check server immediately.")
+
+    @staticmethod
+    def _is_auth_failure(response):
+        if not isinstance(response, dict):
+            return False
+        response_text = str(response)
+        return "DH-906" in response_text or "Invalid Token" in response_text or "Authentication Failed" in response_text
+
+    def _configure_api_client(self, access_token):
+        self.accessToken = access_token
+        if DhanSDK_LEGACY:
+            self.dhan_context = DhanContext(config.CLIENT_ID, access_token)
+            self.dhan = dhanhq(self.dhan_context)
+        else:
+            self.dhan_context = {"client_id": str(config.CLIENT_ID), "access_token": access_token}
+            self.dhan = dhanhq(str(config.CLIENT_ID), access_token)
 
     def get_fund_limits(self):
         try:
@@ -136,6 +183,7 @@ class DhanBroker(metaclass=SingletonMeta):
     def get_limit_price(self, exchange_segment: str, security_id: int, transaction_type: str):
         for _ in range(4):
             try:
+                self._wait_for_api(self.quote_pacer)
                 res = self.dhan.quote_data(securities={exchange_segment: [int(security_id)]})
                 depth = res["data"]["data"][exchange_segment][str(security_id)]["depth"]
                 if transaction_type == "BUY":
@@ -245,6 +293,7 @@ class DhanBroker(metaclass=SingletonMeta):
 
     def get_ltp_from_api(self, exchange_segment, security_id):
         try:
+            self._wait_for_api(self.quote_pacer)
             res = self.dhan.quote_data(securities={exchange_segment: [int(security_id)]})
             if res and res.get("status") == "success":
                 return float(res["data"]["data"][exchange_segment][str(security_id)]["last_price"])
@@ -267,19 +316,107 @@ class DhanBroker(metaclass=SingletonMeta):
         return None
 
     def get_quote_batch(self, exchange_segment, security_ids):
-        try:
-            for _ in range(3):
-                res = self.dhan.quote_data(securities={exchange_segment: [int(s) for s in security_ids]})
-                if res and res.get("status") == "success":
-                    return res["data"]["data"][exchange_segment]
+        security_ids = [str(s) for s in security_ids if s is not None]
+        if not security_ids:
+            logger.warning("Quote batch skipped: no security IDs")
+            return {}
+
+        logger.info(
+            "Quote batch request: segment=%s ids=%s sample=%s",
+            exchange_segment,
+            len(security_ids),
+            security_ids[:3],
+        )
+        request = {exchange_segment: [int(s) for s in security_ids]}
+        refreshed = False
+        for attempt in range(3):
+            try:
+                self._wait_for_api(self.quote_pacer)
+                res = self.dhan.quote_data(securities=request)
+                if not isinstance(res, dict):
+                    logger.warning(
+                        "Quote batch unexpected response type: %s",
+                        type(res).__name__,
+                    )
+                    return {}
+
+                logger.info("Quote batch response: keys=%s", list(res.keys())[:10])
+                if res.get("status") == "success":
+                    quotes = self._extract_quote_data(res, exchange_segment)
+                    logger.info(
+                        "Quote batch parsed: %s/%s usable quotes",
+                        len(quotes),
+                        len(security_ids),
+                    )
+                    return quotes
+
+                logger.warning(
+                    "Dhan quote request failed (attempt %s/3): %s",
+                    attempt + 1,
+                    res.get("data") if isinstance(res, dict) else res,
+                )
+                error_data = res.get("data") if isinstance(res, dict) else None
+                error_text = str(error_data)
+                if "805" in error_text or "904" in error_text or "too many" in error_text.lower():
+                    self._mark_rate_limited()
+                    break
+                if not refreshed and ("808" in error_text or "Authentication Failed" in error_text):
+                    refreshed = True
+                    logger.warning("Dhan quote authentication failed; refreshing access token")
+                    try:
+                        self._configure_api_client(get_valid_access_token(force_refresh=True))
+                        continue
+                    except Exception:
+                        logger.exception("Dhan access-token refresh failed")
+                        break
                 sleep(2)
-        except Exception:
-            logger.exception("Error in get_quote_batch")
-        return None
+            except Exception:
+                logger.exception("Error in get_quote_batch")
+        return {}
+
+    @staticmethod
+    def _extract_quote_data(response, exchange_segment):
+        candidates = [response]
+        data = response.get("data")
+        if isinstance(data, dict):
+            candidates.append(data)
+            nested_data = data.get("data")
+            if isinstance(nested_data, dict):
+                candidates.append(nested_data)
+
+        raw_quotes = None
+        for candidate in candidates:
+            segment_quotes = candidate.get(exchange_segment)
+            if isinstance(segment_quotes, dict):
+                raw_quotes = segment_quotes
+                break
+            security_wise = candidate.get("securityWise")
+            if isinstance(security_wise, dict):
+                raw_quotes = security_wise
+                break
+
+        if raw_quotes is None:
+            return {}
+
+        normalized = {}
+        for security_id, quote in raw_quotes.items():
+            if not isinstance(quote, dict):
+                continue
+            last_price = quote.get("last_price", quote.get("ltp", quote.get("lastPrice")))
+            net_change = quote.get("net_change", quote.get("netChange"))
+            if last_price is None or net_change is None:
+                continue
+            normalized[str(security_id)] = {
+                "last_price": float(last_price),
+                "net_change": float(net_change),
+                "volume": float(quote.get("volume", 0.0) or 0.0),
+            }
+        return normalized
 
     def get_net_change(self, exchange_segment, security_id):
         for _ in range(5):
             try:
+                self._wait_for_api(self.quote_pacer)
                 res = self.dhan.quote_data(securities={exchange_segment: [int(security_id)]})
                 if res and res.get("status") == "success":
                     return float(res["data"]["data"][exchange_segment][str(security_id)]["net_change"])
@@ -290,6 +427,12 @@ class DhanBroker(metaclass=SingletonMeta):
 
     def get_intraday_candles(self, security_id, exchange_segment, instrument_type,
                               from_dt, to_dt=None, timeframe=1, skip_incomplete=True, tz="Asia/Kolkata"):
+        native_intervals = {1, 5, 15, 25, 60}
+        if int(timeframe) not in native_intervals:
+            raise ValueError(
+                f"Dhan native interval must be one of {sorted(native_intervals)}; got {timeframe}. "
+                "Use get_pattern_candles() for derived 3-minute candles."
+            )
         retry_key = f"{security_id}_{timeframe}"
         if time() < _candle_retry_after.get(retry_key, 0):
             return None
@@ -300,6 +443,7 @@ class DhanBroker(metaclass=SingletonMeta):
         to_str = to_dt.strftime("%Y-%m-%d")
         for _ in range(3):
             try:
+                self._wait_for_api(self.data_pacer)
                 res = self.dhan.intraday_minute_data(
                     security_id=security_id, exchange_segment=exchange_segment,
                     instrument_type=instrument_type, from_date=from_str, to_date=to_str,
@@ -334,16 +478,81 @@ class DhanBroker(metaclass=SingletonMeta):
             sleep(1)
         return pd.DataFrame()
 
+    def _completed_1m_only(self, df):
+        current_open = datetime.now(self.timeZone).replace(second=0, microsecond=0)
+        return df[df["timestamp"] < current_open].copy()
+
+    def _resample_session_aligned_3m(self, one_min_df):
+        columns = ["timestamp", "open", "high", "low", "close", "volume"]
+        df = one_min_df.copy().sort_values("timestamp").drop_duplicates("timestamp")
+        df = df.set_index("timestamp").between_time("09:15", "15:29")
+        if df.empty:
+            return pd.DataFrame(columns=columns)
+
+        pieces = []
+        for session_date, day in df.groupby(df.index.date):
+            session_open = pd.Timestamp(session_date, tz=self.timeZone).replace(
+                hour=9, minute=15, second=0, microsecond=0
+            )
+            offset = ((day.index - session_open).total_seconds() // 60).astype(int)
+            day = day.assign(_bucket=(offset // 3) * 3)
+            grouped = day.groupby("_bucket", sort=True).agg(
+                open=("open", "first"), high=("high", "max"), low=("low", "min"),
+                close=("close", "last"), volume=("volume", "sum"), _count=("close", "size")
+            ).reset_index()
+            grouped["timestamp"] = session_open + pd.to_timedelta(grouped["_bucket"], unit="min")
+            if config.DERIVED_CANDLE_REQUIRE_FULL_BUCKET:
+                grouped = grouped[grouped["_count"] == config.DERIVED_CANDLE_MINUTE_COUNT]
+            pieces.append(grouped[columns])
+        if not pieces:
+            return pd.DataFrame(columns=columns)
+        return pd.concat(pieces, ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+
+    def get_pattern_candles(self, security_id, exchange_segment, instrument_type,
+                            from_dt, pattern_timeframe, to_dt=None):
+        source = self.get_intraday_candles(
+            security_id=security_id, exchange_segment=exchange_segment,
+            instrument_type=instrument_type, from_dt=from_dt, to_dt=to_dt,
+            timeframe=config.SOURCE_CANDLE_TIMEFRAME, skip_incomplete=False,
+        )
+        if source is None or source.empty:
+            return pd.DataFrame()
+        if int(pattern_timeframe) == 1:
+            return self._completed_1m_only(source)
+        if int(pattern_timeframe) == 3:
+            return self._resample_session_aligned_3m(self._completed_1m_only(source))
+        return self.get_intraday_candles(
+            security_id=security_id, exchange_segment=exchange_segment,
+            instrument_type=instrument_type, from_dt=from_dt, to_dt=to_dt,
+            timeframe=int(pattern_timeframe), skip_incomplete=True,
+        )
+
     def get_historical_daily_candles(self, security_id, exchange_segment, instrument_type, from_dt, to_dt, tz="Asia/Kolkata"):
         from_str = from_dt.strftime("%Y-%m-%d")
         to_str = to_dt.strftime("%Y-%m-%d")
         for _ in range(5):
             try:
+                self._wait_for_api(self.data_pacer)
                 res = self.dhan.historical_daily_data(
                     security_id=security_id, exchange_segment=exchange_segment,
                     instrument_type=instrument_type, from_date=from_str, to_date=to_str,
                 )
-                df = pd.DataFrame(res["data"])
+                if not isinstance(res, dict) or res.get("status") != "success":
+                    logger.warning(
+                        "Historical candle request failed for %s: %s",
+                        security_id,
+                        res.get("data") if isinstance(res, dict) else res,
+                    )
+                    return pd.DataFrame()
+                candle_data = res.get("data")
+                if not isinstance(candle_data, (dict, list)):
+                    logger.warning(
+                        "Historical candle response malformed for %s: data_type=%s",
+                        security_id,
+                        type(candle_data).__name__,
+                    )
+                    return pd.DataFrame()
+                df = pd.DataFrame(candle_data)
                 if df.empty:
                     return df
                 df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert(tz)

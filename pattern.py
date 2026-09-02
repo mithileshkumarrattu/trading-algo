@@ -68,13 +68,13 @@ def candle_body_ratio(candle) -> float:
     return abs(candle.close - candle.open) / candle_range
 
 
-def find_trend_run_and_alpha(candles_5m, is_bullish_setup):
+def find_trend_run_and_alpha(pattern_candles, is_bullish_setup):
     """
     Scans a day's worth of pattern candles (default 3-minute bars) in time order,
     looking for a qualifying trend run followed immediately by a counter-colour
     Alpha Candle. Returns None if no complete pattern exists yet in the data.
     """
-    if candles_5m is None or len(candles_5m) < MIN_TREND_CANDLES + 1:
+    if pattern_candles is None or len(pattern_candles) < MIN_TREND_CANDLES + 1:
         return None
 
     trend_colour_green = is_bullish_setup
@@ -82,14 +82,14 @@ def find_trend_run_and_alpha(candles_5m, is_bullish_setup):
     alpha_candle = None
     alpha_idx = None
 
-    for i in range(len(candles_5m)):
-        c = candles_5m.iloc[i]
+    for i in range(len(pattern_candles)):
+        c = pattern_candles.iloc[i]
 
         # Loosened volume check: compare against day-so-far AVERAGE volume,
         # not an absolute ratcheting day-low. Allows natural volume tapering
         # in a genuine trend while still filtering dead/illiquid candles.
         if i > 0:
-            prior_avg_vol = candles_5m.iloc[:i]["volume"].mean()
+            prior_avg_vol = pattern_candles.iloc[:i]["volume"].mean()
             vol_ok = c.volume >= (prior_avg_vol * VOLUME_FLOOR_PCT_OF_AVG)
         else:
             vol_ok = True
@@ -140,15 +140,20 @@ def check_1min_breakout(candles_1m_since_alpha, alpha_high, alpha_low, is_bullis
 
     for _, candle in candles_1m_since_alpha.iterrows():
         if is_bullish_setup:
-            if float(candle["high"]) > float(alpha_high):
+            wick_cross = float(candle["high"]) > float(alpha_high)
+            close_confirm = float(candle["close"]) > float(alpha_high)
+            if wick_cross and (not config.REQUIRE_ENTRY_CLOSE_BEYOND_TRIGGER or close_confirm):
                 return candle
-        elif float(candle["low"]) < float(alpha_low):
-            return candle
+        else:
+            wick_cross = float(candle["low"]) < float(alpha_low)
+            close_confirm = float(candle["close"]) < float(alpha_low)
+            if wick_cross and (not config.REQUIRE_ENTRY_CLOSE_BEYOND_TRIGGER or close_confirm):
+                return candle
     return None
 
 
 def hold_window_expired(alpha_detected_at) -> bool:
-    hold_candles = int(getattr(config, "HOLD_CANDLES_5MIN", 3))
+    hold_candles = int(getattr(config, "HOLD_CANDLES_PATTERN", 2))
     pattern_minutes = int(getattr(config, "PATTERN_TIMEFRAME", PATTERN_TIMEFRAME_MINUTES))
     budget = timedelta(minutes=hold_candles * pattern_minutes)
     return datetime.now(config.TIME_ZONE) > (alpha_detected_at + budget)

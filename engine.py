@@ -50,6 +50,11 @@ def calc_quantity(entry_price, sl_price):
     return max(1, math.floor(config.RISK_PER_TRADE / risk_per_share))
 
 
+def apply_paper_entry_slippage(price, transaction_type):
+    bps = config.PAPER_SLIPPAGE_BPS / 10_000.0
+    return price * (1 + bps) if transaction_type == "BUY" else price * (1 - bps)
+
+
 def can_take_new_trade():
     import timing
     snap = state.snapshot()
@@ -63,7 +68,8 @@ def can_take_new_trade():
 
 
 def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha_low, entry_candle,
-                tick_size=0.05, alpha_open_time=None, alpha_close_time=None, alpha_key=None):
+                tick_size=0.05, alpha_open_time=None, alpha_close_time=None, alpha_key=None,
+                strategy="ALPHA"):
     ok, reason = can_take_new_trade()
     if not ok:
         state.add_log(f"{symbol}: entry blocked - {reason}")
@@ -71,12 +77,15 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
 
     transaction_type = "BUY" if is_bullish_setup else "SELL"
     entry_price = float(entry_candle.close)
+    if config.PAPER_MODE:
+        entry_price = apply_paper_entry_slippage(entry_price, transaction_type)
     sl_price = pattern.initial_stop_loss(alpha_high, alpha_low, is_bullish_setup, entry_price)
+    max_stop_pct = config.JP_MAX_STOP_DISTANCE_PCT if strategy.upper() == "JP" else config.MAX_STOP_DISTANCE_PCT
     stop_distance_pct = abs(entry_price - sl_price) / entry_price * 100
-    if stop_distance_pct > config.MAX_STOP_DISTANCE_PCT:
+    if stop_distance_pct > max_stop_pct:
         state.add_log(
             f"{symbol}: entry rejected - stop distance "
-            f"{stop_distance_pct:.2f}% exceeds {config.MAX_STOP_DISTANCE_PCT:.2f}%"
+            f"{stop_distance_pct:.2f}% exceeds {max_stop_pct:.2f}%"
         )
         return None
     qty = calc_quantity(entry_price, sl_price)
@@ -85,8 +94,8 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
         return None
 
     risk_distance = abs(entry_price - sl_price)
-    target_r2_price = (entry_price + config.FIRST_TARGET_R_MULTIPLE * risk_distance) if is_bullish_setup \
-        else (entry_price - config.FIRST_TARGET_R_MULTIPLE * risk_distance)
+    target_r2_price = (entry_price + config.DESIRED_TARGET_R * risk_distance) if is_bullish_setup \
+        else (entry_price - config.DESIRED_TARGET_R * risk_distance)
 
     cost_to_cost_trade = state.snapshot()["cost_to_cost_mode"]
 
@@ -115,7 +124,7 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
                                           limit_price=sl_price, trigger_price=sl_price, tick_size=tick_size)
 
     position = {
-        "strategy": "ALPHA",
+        "strategy": strategy,
         "entry_reason": "1_MIN_WICK_BREAK",
         "trigger_price_level": float(alpha_high if is_bullish_setup else alpha_low),
         "security_id": str(security_id),
@@ -135,6 +144,12 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
         "best_price_since_r2": entry_price,
         "cost_to_cost_trade": cost_to_cost_trade,
         "alpha_key": alpha_key,
+        "setup_key": alpha_key,
+        "pattern_timeframe": config.PATTERN_TIMEFRAME,
+        "pattern_open_time": alpha_open_time,
+        "pattern_close_time": alpha_close_time,
+        "pattern_high": float(alpha_high),
+        "pattern_low": float(alpha_low),
         "alpha_open_time": alpha_open_time,
         "alpha_close_time": alpha_close_time,
         "alpha_high": float(alpha_high),
@@ -165,6 +180,9 @@ def _close_position(broker, security_id, exit_price, exit_qty, reason):
 
     transaction_type = pos["transaction_type"]
     direction = 1 if transaction_type == "BUY" else -1
+    if config.PAPER_MODE and not pos.get("cost_to_cost_trade"):
+        exit_transaction = "SELL" if transaction_type == "BUY" else "BUY"
+        exit_price = apply_paper_entry_slippage(float(exit_price), exit_transaction)
     pnl = direction * (exit_price - pos["entry_price"]) * exit_qty
 
     if pos.get("cost_to_cost_trade"):
@@ -178,6 +196,7 @@ def _close_position(broker, security_id, exit_price, exit_qty, reason):
             logger.exception(f"Error closing live position {security_id}")
 
     trade_record = {
+        "strategy": pos.get("strategy", "ALPHA"),
         "symbol": pos["symbol"],
         "security_id": str(security_id),
         "transaction_type": transaction_type,

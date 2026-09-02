@@ -29,9 +29,23 @@ def _send_raw(message: str):
     try:
         with requests.Session() as session:
             res = session.get(url, params=params, timeout=5)
-            logger.info(f"Telegram response {res.status_code}")
+            body = ""
+            try:
+                body = res.text
+            except Exception:
+                body = "<unavailable>"
+
+            if res.status_code >= 400:
+                logger.warning(
+                    "Telegram HTTP %s for chat_id=%s: %s",
+                    res.status_code,
+                    config.BOT_CHAT_ID,
+                    body[:1000] if body else "(empty body)",
+                )
+            else:
+                logger.info("Telegram response %s", res.status_code)
     except requests.RequestException as e:
-        logger.info(f"Telegram send error: {e}")
+        logger.warning("Telegram send error: %s", e)
 
 
 def send_telegram(message: str):

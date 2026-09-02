@@ -32,6 +32,7 @@ from broker import DhanBroker
 
 _stop_event = threading.Event()
 _candle_cache = {}
+_pattern_candle_cache = {}
 _processed_alpha_1m_candles = set()
 
 
@@ -51,6 +52,22 @@ def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seco
     )
     if candles is not None and not candles.empty:
         _candle_cache[key] = {"fetched_at": now, "data": candles}
+    return candles
+
+
+def get_cached_pattern_candles(broker, security_id, prev_trade_date, timeframe):
+    key = f"{security_id}_{timeframe}"
+    now = time.time()
+    cached = _pattern_candle_cache.get(key)
+    if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
+        return cached["data"]
+    candles = broker.get_pattern_candles(
+        security_id=security_id, exchange_segment=config.EXCHANGE,
+        instrument_type="EQUITY", from_dt=prev_trade_date,
+        pattern_timeframe=timeframe,
+    )
+    if candles is not None and not candles.empty:
+        _pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
     return candles
 
 
@@ -153,11 +170,11 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
     low = float(latest_completed_1m_bar.get("low", 0.0))
     close = float(latest_completed_1m_bar.get("close", 0.0))
 
-    trigger_level = float(
-        setup.get("alpha_high" if direction == "BUY" else "alpha_low")
-        or setup.get("jp_high" if direction == "BUY" else "jp_low")
-        or 0.0
-    )
+    trigger_level = float(setup.get("trigger_price") or setup.get(
+        "pattern_high" if direction == "BUY" else "pattern_low"
+    ) or setup.get("alpha_high" if direction == "BUY" else "alpha_low") or setup.get(
+        "jp_high" if direction == "BUY" else "jp_low"
+    ) or 0.0)
     if trigger_level <= 0:
         return None
 
@@ -167,6 +184,11 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         state.set_jp_watchlist_item(security_id, setup)
     else:
         state.set_alpha_watchlist_item(security_id, setup)
+
+    if strategy == "JP" and config.JP_DETECTION_ONLY:
+        state.log_setup_outcome(setup, "JP_TRIGGER_DETECTED_ONLY", "")
+        state.remove_jp_setup(security_id)
+        return "JP_TRIGGER_DETECTED_ONLY"
 
     if not crossed:
         return None
@@ -193,14 +215,20 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         return "SKIPPED_NO_LTP"
 
     fill = max(float(ltp), close) if direction == "BUY" else min(float(ltp), close)
+    alpha_high = float(setup.get("alpha_high") if setup.get("alpha_high") is not None else setup.get("jp_high") or trigger_level)
+    alpha_low = float(setup.get("alpha_low") if setup.get("alpha_low") is not None else setup.get("jp_low") or trigger_level)
+    alpha_open_time = setup.get("alpha_open_time") or setup.get("jp_open_time")
+    alpha_close_time = setup.get("alpha_close_time") or setup.get("jp_close_time")
+    alpha_key = setup.get("alpha_key") or setup.get("jp_key")
 
     position = engine.enter_trade(
         broker=broker,
         security_id=int(security_id),
         symbol=symbol,
         is_bullish_setup=(direction == "BUY"),
-        alpha_high=float(setup.get("alpha_high") or setup.get("jp_high") or trigger_level),
-        alpha_low=float(setup.get("alpha_low") or setup.get("jp_low") or trigger_level),
+        strategy=strategy,
+        alpha_high=alpha_high,
+        alpha_low=alpha_low,
         entry_candle=type("_EntryBar", (), {
             "open": float(latest_completed_1m_bar.get("open", fill)),
             "high": high,
@@ -208,9 +236,9 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
             "close": fill,
             "timestamp": bar_time,
         })(),
-        alpha_open_time=setup.get("alpha_open_time") or setup.get("jp_open_time"),
-        alpha_close_time=setup.get("alpha_close_time") or setup.get("jp_close_time"),
-        alpha_key=setup.get("alpha_key") or setup.get("jp_key"),
+        alpha_open_time=alpha_open_time,
+        alpha_close_time=alpha_close_time,
+        alpha_key=alpha_key,
     )
 
     if position is not None:
@@ -315,19 +343,16 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
         return
 
     try:
-        candles_5m = get_cached_candles(
-            broker=broker, security_id=security_id, prev_trade_date=prev_trade_date,
-            timeframe=config.JP_TIMEFRAME, ttl_seconds=25,
-        )
+        candles_3m = get_cached_pattern_candles(broker, security_id, prev_trade_date, config.JP_TIMEFRAME)
     except Exception:
         logger.exception(f"JP pattern candle fetch failed for {symbol}")
         return
-    if candles_5m is None or candles_5m.empty:
+    if candles_3m is None or candles_3m.empty:
         return
 
     today = datetime.now(config.TIME_ZONE).date()
-    candles_5m = candles_5m[candles_5m["timestamp"].dt.date == today].copy()
-    result = jp_pattern.find_jp_setup(candles_5m, is_bullish_setup)
+    candles_3m = candles_3m[candles_3m["timestamp"].dt.date == today].copy()
+    result = jp_pattern.find_jp_setup(candles_3m, is_bullish_setup)
     if result is None:
         return
 
@@ -351,7 +376,13 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
 
     item = {
         "strategy": "JP", "symbol": symbol, "security_id": str(security_id),
-        "direction": result["direction"], "stage": "AWAITING_NEXT_5M_CONFIRMATION",
+        "direction": result["direction"], "stage": "AWAITING_1M_TRIGGER",
+        "pattern_timeframe": config.JP_TIMEFRAME,
+        "pattern_open_time": result["jp_open_time"].isoformat(),
+        "pattern_close_time": result["jp_close_time"].isoformat(),
+        "pattern_high": result["pattern_high"], "pattern_low": result["pattern_low"],
+        "jp_high": result["trigger_price"] if result["direction"] == "BUY" else result["pattern_high"],
+        "jp_low": result["trigger_price"] if result["direction"] == "SELL" else result["pattern_low"],
         "jp_open_time": result["jp_open_time"].isoformat(),
         "jp_close_time": result["jp_close_time"].isoformat(),
         "trigger_price": result["trigger_price"], "stop_price": result["stop_price"],
@@ -391,19 +422,18 @@ def scan_candidate(broker, candidate, prev_trade_date):
             return
 
     try:
-        candles_5m = get_cached_candles(
-            broker=broker, security_id=security_id, prev_trade_date=prev_trade_date,
-            timeframe=config.PATTERN_TIMEFRAME, ttl_seconds=25,
+        pattern_candles = get_cached_pattern_candles(
+            broker, security_id, prev_trade_date, config.PATTERN_TIMEFRAME
         )
-        if candles_5m is None or candles_5m.empty:
+        if pattern_candles is None or pattern_candles.empty:
             return
-        today_5m = candles_5m[candles_5m["timestamp"].dt.date == datetime.now(config.TIME_ZONE).date()]
+        today_pattern = pattern_candles[pattern_candles["timestamp"].dt.date == datetime.now(config.TIME_ZONE).date()]
     except Exception:
         logger.exception(f"Pattern-timeframe candle fetch failed for {symbol}")
         return
 
     if watchlist_entry is None or watchlist_entry.get("stage") != "AWAITING_BREAKOUT":
-        result = pattern.find_trend_run_and_alpha(today_5m, is_bullish_setup)
+        result = pattern.find_trend_run_and_alpha(today_pattern, is_bullish_setup)
         if result is None:
             state.remove_watchlist_item(security_id)
             return
@@ -418,7 +448,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
             return
         direction = "BUY" if is_bullish_setup else "SELL"
         alpha_open_time = alpha.timestamp.to_pydatetime()
-        alpha_close_time = alpha_open_time + timedelta(minutes=config.PATTERN_TIMEFRAME)
+        alpha_close_time = alpha_open_time + timedelta(minutes=config.ALPHA_TIMEFRAME)
         now = datetime.now(config.TIME_ZONE)
         alpha_age_minutes = (now - alpha_close_time).total_seconds() / 60.0
         alpha_key = f"{security_id}_{direction}_{alpha_open_time.isoformat()}"
@@ -451,7 +481,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
             "current_ltp": None,
             "distance_to_trigger_pct": None,
             "hold_expires_at": (alpha_close_time + timedelta(
-                minutes=config.HOLD_CANDLES_5MIN * config.PATTERN_TIMEFRAME
+                minutes=config.HOLD_CANDLES_PATTERN * config.PATTERN_TIMEFRAME
             )).isoformat(),
             "alpha_key": alpha_key,
         })
