@@ -36,6 +36,16 @@ _pattern_candle_cache = {}
 _processed_alpha_1m_candles = set()
 
 
+def validate_runtime_config():
+    missing = [name for name in config.STARTUP_REQUIRED_CONFIG if not hasattr(config, name)]
+    if missing:
+        raise RuntimeError(f"Missing required config attributes: {', '.join(missing)}")
+    if config.ENTRY_TIMEFRAME != 1 or config.SOURCE_CANDLE_TIMEFRAME != 1:
+        raise RuntimeError("ENTRY_TIMEFRAME and SOURCE_CANDLE_TIMEFRAME must both be 1")
+    if config.ALPHA_TIMEFRAME != 3 or config.JP_TIMEFRAME != 3 or config.PATTERN_TIMEFRAME != 3:
+        raise RuntimeError("Alpha, JP, and pattern timeframes must all be 3")
+
+
 def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seconds):
     key = f"{security_id}_{timeframe}"
     now = time.time()
@@ -599,6 +609,7 @@ def scan_loop(broker, prev_trade_date):
 
 
 def main():
+    validate_runtime_config()
     state.reset_daily()
     state.update({"started_at": datetime.now(config.TIME_ZONE).isoformat(), "paper_mode": config.PAPER_MODE})
     state.add_log(f"AlphaCandle starting. PAPER_MODE={config.PAPER_MODE}")

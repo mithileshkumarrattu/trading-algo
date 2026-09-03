@@ -6,6 +6,28 @@ import state
 import main
 
 
+def test_runtime_config_contract():
+    main.validate_runtime_config()
+
+
+def test_quote_change_normalization_produces_positive_move():
+    response = {
+        "status": "success",
+        "data": {
+            "data": {
+                "NSE_EQ": {
+                    "1333": {"last_price": 104.63, "net_change": 4.63}
+                }
+            }
+        },
+    }
+    parsed = main.DhanBroker._extract_quote_data(response, "NSE_EQ")
+    quote = parsed["1333"]
+    pct_change = quote["net_change"] / (quote["last_price"] - quote["net_change"]) * 100
+    assert round(pct_change, 2) == 4.63
+    assert config.MIN_PCT_MOVE <= pct_change <= config.MAX_PCT_MOVE
+
+
 def test_fetch_batch_quotes_reports_coverage(monkeypatch):
     monkeypatch.setattr(discovery.config, "DISCOVERY_QUOTE_CHUNK", 2)
     monkeypatch.setattr(discovery.time, "sleep", lambda _: None)

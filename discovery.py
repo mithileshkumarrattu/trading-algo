@@ -133,12 +133,16 @@ def run_full_universe_scan(broker, universe_df):
     invalid_previous_close = 0
     blacklisted = 0
     malformed_quotes = 0
+    missing_change_field = 0
     eligible = 0
     for sid_str, data in quotes.items():
         try:
             sid = int(sid_str)
             ltp = float(data.get("last_price", 0.0))
             net_change = float(data.get("net_change", 0.0))
+            if "net_change" not in data:
+                missing_change_field += 1
+                continue
             volume = float(data.get("volume", 0.0)) if data.get("volume") is not None else 0.0
             if ltp < config.MIN_PRICE:
                 continue
@@ -204,10 +208,11 @@ def run_full_universe_scan(broker, universe_df):
 
     logger.info(
         "Discovery scan complete: %s gainers, %s losers qualify "
-        "(quoted=%s, eligible=%s, below_min=%s, above_max=%s, "
-        "invalid_prev_close=%s, blacklisted=%s, malformed=%s)",
-        len(gainers), len(losers), len(quotes), eligible, below_min_move,
+        "(quoted=%s, parsed=%s, eligible=%s, below_min=%s, above_max=%s, "
+        "invalid_prev_close=%s, blacklisted=%s, malformed=%s, missing_change=%s)",
+        len(gainers), len(losers), len(quotes), len(quotes), eligible, below_min_move,
         above_max_move, invalid_previous_close, blacklisted, malformed_quotes,
+        missing_change_field,
     )
     state.add_log(f"Discovery refreshed: {len(gainers)} gainers / {len(losers)} losers in the {config.MIN_PCT_MOVE}%-{config.MAX_PCT_MOVE}% band")
 

@@ -102,6 +102,7 @@ class DhanBroker(metaclass=SingletonMeta):
         self.quote_pacer = RequestPacer(1.0 / config.QUOTE_API_MAX_REQUESTS_PER_SECOND)
         self.data_pacer = RequestPacer(1.0 / config.DATA_API_MAX_REQUESTS_PER_SECOND)
         self.rate_limited_until = 0.0
+        self._quote_cooldown_warned_until = 0.0
         self.start = time()
         self.login()
 
@@ -328,7 +329,9 @@ class DhanBroker(metaclass=SingletonMeta):
             security_ids[:3],
         )
         if time() < self.rate_limited_until:
-            logger.warning("Quote API cooldown active; skipping request")
+            if time() >= self._quote_cooldown_warned_until:
+                logger.warning("Quote API cooldown active; skipping requests")
+                self._quote_cooldown_warned_until = self.rate_limited_until
             return {}
 
         request = {exchange_segment: [int(s) for s in security_ids]}
@@ -336,7 +339,9 @@ class DhanBroker(metaclass=SingletonMeta):
         for attempt in range(3):
             try:
                 if time() < self.rate_limited_until:
-                    logger.warning("Quote API cooldown active; skipping request")
+                    if time() >= self._quote_cooldown_warned_until:
+                        logger.warning("Quote API cooldown active; skipping requests")
+                        self._quote_cooldown_warned_until = self.rate_limited_until
                     return {}
                 self._wait_for_api(self.quote_pacer)
                 res = self.dhan.quote_data(securities=request)
@@ -405,22 +410,25 @@ class DhanBroker(metaclass=SingletonMeta):
         if raw_quotes is None:
             return {}
 
+        diagnostic_logged = getattr(DhanBroker, "_quote_schema_logged", False)
         if raw_quotes:
             first_security_id, first_quote = next(iter(raw_quotes.items()))
-            logger.info(
-                "Dhan quote sample: security_id=%s keys=%s values=%s",
-                first_security_id,
-                list(first_quote.keys()) if isinstance(first_quote, dict) else type(first_quote).__name__,
-                {
-                    key: first_quote.get(key)
-                    for key in (
-                        "last_price", "lastPrice", "ltp", "net_change", "netChange",
-                        "change", "change_percent", "net_change_percent",
-                        "previous_close", "prev_close", "previousClose", "close",
-                    )
-                    if isinstance(first_quote, dict) and key in first_quote
-                },
-            )
+            if not diagnostic_logged:
+                logger.info(
+                    "Dhan quote sample: security_id=%s keys=%s values=%s",
+                    first_security_id,
+                    list(first_quote.keys()) if isinstance(first_quote, dict) else type(first_quote).__name__,
+                    {
+                        key: first_quote.get(key)
+                        for key in (
+                            "last_price", "lastPrice", "ltp", "net_change", "netChange",
+                            "change", "change_percent", "net_change_percent",
+                            "previous_close", "prev_close", "previousClose", "close",
+                        )
+                        if isinstance(first_quote, dict) and key in first_quote
+                    },
+                )
+                DhanBroker._quote_schema_logged = True
 
         normalized = {}
         for security_id, quote in raw_quotes.items():
