@@ -112,30 +112,34 @@ def valid_alpha_pullback_candle(candle, trend_volumes):
 
 def find_alpha_buy_setup(pattern_candles):
     """
-    Scans a day's worth of pattern candles (default 3-minute bars) in time order,
-    looking for a qualifying trend run followed immediately by a counter-colour
-    Alpha Candle. Returns None if no complete pattern exists yet in the data.
+    Detect an Alpha BUY only when the candidate red candle immediately follows
+    a contiguous, valid run of green 3-minute trend candles.
     """
-    if pattern_candles is None or len(pattern_candles) < config.ALPHA_MIN_TREND_CANDLES + 1:
+    min_run = config.ALPHA_MIN_TREND_CANDLES
+    if pattern_candles is None or len(pattern_candles) < min_run + 2:
         return None
 
-    trend_run = []
-    for alpha_idx in range(config.ALPHA_MIN_TREND_CANDLES, len(pattern_candles)):
-        trend_run = []
-        for index in range(alpha_idx):
-            candle = pattern_candles.iloc[index]
-            if not valid_alpha_trend_candle(candle, pattern_candles.iloc[max(0, index - 3):index]["volume"]):
-                trend_run = []
-                continue
-            if trend_run and float(candle.close) <= float(trend_run[-1].high):
-                trend_run = []
-                continue
-            trend_run.append(candle)
-        if len(trend_run) < config.ALPHA_MIN_TREND_CANDLES:
-            continue
+    for alpha_idx in range(min_run, len(pattern_candles)):
         alpha = pattern_candles.iloc[alpha_idx]
-        if not valid_alpha_pullback_candle(alpha, [float(c.volume) for c in trend_run]):
+        candidate_window = pattern_candles.iloc[max(0, alpha_idx - min_run):alpha_idx]
+        trend_volumes = [float(c.volume) for _, c in candidate_window.iterrows() if float(c.volume) > 0]
+        if not valid_alpha_pullback_candle(alpha, trend_volumes):
             continue
+
+        reversed_run = []
+        for index in range(alpha_idx - 1, -1, -1):
+            candle = pattern_candles.iloc[index]
+            recent_volumes = pattern_candles.iloc[max(0, index - 3):index]["volume"]
+            if not valid_alpha_trend_candle(candle, recent_volumes):
+                break
+            if reversed_run and float(reversed_run[-1].close) <= float(candle.high):
+                break
+            reversed_run.append(candle)
+
+        trend_run = list(reversed(reversed_run))
+        if len(trend_run) < min_run:
+            continue
+
         confirmations = pattern_candles.iloc[
             alpha_idx + 1:alpha_idx + 1 + config.ALPHA_CONFIRMATION_PATTERN_BARS
         ]

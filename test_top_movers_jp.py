@@ -33,6 +33,19 @@ def test_alpha_pullback_rejects_extreme_volume():
     assert not pattern.valid_alpha_pullback_candle(pullback, [100, 100, 100])
 
 
+def test_alpha_run_must_be_immediately_before_pullback():
+    candles = [
+        _candle(100, 102, 99, 101.5),
+        _candle(101.5, 104, 101, 103.5),
+        _candle(103.5, 106, 103, 105.5),
+        _candle(105.5, 106, 104, 105.7),
+        _candle(105.7, 106, 101, 102, volume=100),
+        _candle(102, 107, 101, 106, volume=100),
+    ]
+    frame = __import__("pandas").DataFrame([vars(candle) for candle in candles])
+    assert pattern.find_alpha_buy_setup(frame) is None
+
+
 def test_quote_change_normalization_produces_positive_move():
     response = {
         "status": "success",
