@@ -1,13 +1,36 @@
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import config
 import discovery
 import state
 import main
+import pattern
 
 
 def test_runtime_config_contract():
     main.validate_runtime_config()
+
+
+def _candle(open_price, high, low, close, volume=100):
+    return SimpleNamespace(open=open_price, high=high, low=low, close=close, volume=volume)
+
+
+def test_alpha_quality_helpers_reject_weak_candles():
+    doji = _candle(100, 110, 90, 100.5)
+    weak_wick = _candle(100, 110, 90, 101)
+    assert pattern.is_doji(doji)
+    assert pattern.candle_body_ratio(weak_wick) < config.ALPHA_MIN_TREND_BODY_RATIO
+    assert pattern.body_to_wick_ratio(weak_wick) < config.ALPHA_MIN_TREND_BODY_TO_WICK_RATIO
+
+
+def test_alpha_is_buy_only():
+    assert pattern.find_trend_run_and_alpha([], False) is None
+
+
+def test_alpha_pullback_rejects_extreme_volume():
+    pullback = _candle(110, 111, 100, 101, volume=1000)
+    assert not pattern.valid_alpha_pullback_candle(pullback, [100, 100, 100])
 
 
 def test_quote_change_normalization_produces_positive_move():

@@ -68,64 +68,97 @@ def candle_body_ratio(candle) -> float:
     return abs(candle.close - candle.open) / candle_range
 
 
-def find_trend_run_and_alpha(pattern_candles, is_bullish_setup):
+def candle_range(candle) -> float:
+    return max(0.0, float(candle.high) - float(candle.low))
+
+
+def candle_body(candle) -> float:
+    return abs(float(candle.close) - float(candle.open))
+
+
+def total_wick(candle) -> float:
+    upper = float(candle.high) - max(float(candle.open), float(candle.close))
+    lower = min(float(candle.open), float(candle.close)) - float(candle.low)
+    return max(0.0, upper) + max(0.0, lower)
+
+
+def body_to_wick_ratio(candle) -> float:
+    wick = total_wick(candle)
+    return candle_body(candle) / wick if wick > 0 else float("inf")
+
+
+def relative_volume(candle, recent_volumes) -> float:
+    values = [float(value) for value in recent_volumes if float(value) > 0]
+    return float(candle.volume) / (sum(values) / len(values)) if values else 1.0
+
+
+def valid_alpha_trend_candle(candle, recent_volumes):
+    return (
+        is_green(candle)
+        and candle_body_ratio(candle) >= config.ALPHA_MIN_TREND_BODY_RATIO
+        and body_to_wick_ratio(candle) >= config.ALPHA_MIN_TREND_BODY_TO_WICK_RATIO
+        and relative_volume(candle, recent_volumes) >= config.ALPHA_MIN_TREND_VOLUME_RATIO
+    )
+
+
+def valid_alpha_pullback_candle(candle, trend_volumes):
+    return (
+        is_red(candle)
+        and candle_body_ratio(candle) >= config.ALPHA_MIN_ALPHA_BODY_RATIO
+        and body_to_wick_ratio(candle) >= config.ALPHA_MIN_ALPHA_BODY_TO_WICK_RATIO
+        and relative_volume(candle, trend_volumes) <= config.ALPHA_MAX_ALPHA_VOLUME_RATIO
+    )
+
+
+def find_alpha_buy_setup(pattern_candles):
     """
     Scans a day's worth of pattern candles (default 3-minute bars) in time order,
     looking for a qualifying trend run followed immediately by a counter-colour
     Alpha Candle. Returns None if no complete pattern exists yet in the data.
     """
-    if pattern_candles is None or len(pattern_candles) < MIN_TREND_CANDLES + 1:
+    if pattern_candles is None or len(pattern_candles) < config.ALPHA_MIN_TREND_CANDLES + 1:
         return None
 
-    trend_colour_green = is_bullish_setup
     trend_run = []
-    alpha_candle = None
-    alpha_idx = None
-
-    for i in range(len(pattern_candles)):
-        c = pattern_candles.iloc[i]
-
-        # Loosened volume check: compare against day-so-far AVERAGE volume,
-        # not an absolute ratcheting day-low. Allows natural volume tapering
-        # in a genuine trend while still filtering dead/illiquid candles.
-        if i > 0:
-            prior_avg_vol = pattern_candles.iloc[:i]["volume"].mean()
-            vol_ok = c.volume >= (prior_avg_vol * VOLUME_FLOOR_PCT_OF_AVG)
-        else:
-            vol_ok = True
-
-        is_trend_colour = is_green(c) if trend_colour_green else is_red(c)
-        is_counter_colour = is_red(c) if trend_colour_green else is_green(c)
-
-        if alpha_candle is None:
-            if is_trend_colour and not is_doji(c) and vol_ok:
-                closes_beyond_prev = True
-                if trend_run:
-                    prev = trend_run[-1]
-                    closes_beyond_prev = (c.close > prev.high) if trend_colour_green else (c.close < prev.low)
-                if closes_beyond_prev:
-                    trend_run.append(c)
-                else:
-                    trend_run = [c]
-            elif is_trend_colour:
-                # trend-coloured but doji or too-low volume -> breaks the run
+    for alpha_idx in range(config.ALPHA_MIN_TREND_CANDLES, len(pattern_candles)):
+        trend_run = []
+        for index in range(alpha_idx):
+            candle = pattern_candles.iloc[index]
+            if not valid_alpha_trend_candle(candle, pattern_candles.iloc[max(0, index - 3):index]["volume"]):
                 trend_run = []
-            elif is_counter_colour and len(trend_run) >= MIN_TREND_CANDLES:
-                alpha_candle = c
-                alpha_idx = i
-            else:
+                continue
+            if trend_run and float(candle.close) <= float(trend_run[-1].high):
                 trend_run = []
-        else:
-            break
+                continue
+            trend_run.append(candle)
+        if len(trend_run) < config.ALPHA_MIN_TREND_CANDLES:
+            continue
+        alpha = pattern_candles.iloc[alpha_idx]
+        if not valid_alpha_pullback_candle(alpha, [float(c.volume) for c in trend_run]):
+            continue
+        confirmations = pattern_candles.iloc[
+            alpha_idx + 1:alpha_idx + 1 + config.ALPHA_CONFIRMATION_PATTERN_BARS
+        ]
+        confirmation = confirmations[
+            (confirmations["high"] > float(alpha.high))
+            & (confirmations["close"] > float(alpha.high))
+        ]
+        if confirmation.empty:
+            continue
+        return {
+            "alpha_candle": alpha,
+            "alpha_idx": alpha_idx,
+            "trend_run": trend_run,
+            "pattern_confirmation_time": confirmation.iloc[0].timestamp,
+            "detected_at": datetime.now(config.TIME_ZONE),
+        }
+    return None
 
-    if alpha_candle is None:
-        return None
-    return {
-        "alpha_candle": alpha_candle,
-        "alpha_idx": alpha_idx,
-        "trend_run": trend_run,
-        "detected_at": datetime.now(config.TIME_ZONE),
-    }
+
+def find_trend_run_and_alpha(pattern_candles, is_bullish_setup):
+    if not is_bullish_setup or not config.ALPHA_ALLOW_SELL:
+        return find_alpha_buy_setup(pattern_candles) if is_bullish_setup else None
+    return find_alpha_buy_setup(pattern_candles)
 
 
 def check_1min_breakout(candles_1m_since_alpha, alpha_high, alpha_low, is_bullish_setup):

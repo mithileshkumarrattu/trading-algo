@@ -38,6 +38,23 @@ def _touches_band(candle, band_low: float, band_high: float) -> bool:
     return candle_low <= band_high and candle_high >= band_low
 
 
+def touches_band(candle, band_low, band_high):
+    return float(candle.low) <= float(band_high) and float(candle.high) >= float(band_low)
+
+
+def close_above_band(candle, band_high):
+    return float(candle.close) > float(band_high)
+
+
+def close_below_band(candle, band_low):
+    return float(candle.close) < float(band_low)
+
+
+def _body_ratio(candle):
+    candle_range = max(0.0, float(candle.high) - float(candle.low))
+    return abs(float(candle.close) - float(candle.open)) / candle_range if candle_range else 0.0
+
+
 def _is_uptrend(df: pd.DataFrame, index: int) -> bool:
     if index < 2:
         return False
@@ -70,7 +87,7 @@ def _is_downtrend(df: pd.DataFrame, index: int) -> bool:
 
 def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool):
     """Return the most recent fresh JP pullback candidate, if any."""
-    required = config.JP_SMMA_LENGTH + 3
+    required = config.JP_SMMA_LENGTH + config.JP_CONTEXT_BARS + 2
     if pattern_candles is None or len(pattern_candles) < required:
         return None
 
@@ -81,11 +98,29 @@ def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool):
     if len(df) < 3:
         return None
 
-    jp_index = len(df) - 1
+    jp_index = len(df) - 2 if config.JP_REQUIRE_NEXT_PATTERN_CONFIRMATION else len(df) - 1
     candle = df.iloc[jp_index]
     band_low = min(float(candle.jp_smma_high), float(candle.jp_smma_close))
     band_high = max(float(candle.jp_smma_high), float(candle.jp_smma_close))
-    if not _touches_band(candle, band_low, band_high):
+    prior = df.iloc[max(0, jp_index - config.JP_CONTEXT_BARS):jp_index]
+    prior_touch_count = sum(
+        touches_band(row, min(float(row.jp_smma_high), float(row.jp_smma_close)),
+                     max(float(row.jp_smma_high), float(row.jp_smma_close)))
+        for _, row in prior.iterrows()
+    )
+    if prior_touch_count > config.JP_MAX_PRIOR_BAND_TOUCHES:
+        return None
+    if is_bullish_setup:
+        trend_side_count = sum(close_above_band(row, max(float(row.jp_smma_high), float(row.jp_smma_close))) for _, row in prior.iterrows())
+    else:
+        trend_side_count = sum(close_below_band(row, min(float(row.jp_smma_high), float(row.jp_smma_close))) for _, row in prior.iterrows())
+    if trend_side_count < config.JP_MIN_PRIOR_BARS_TREND_SIDE:
+        return None
+    if not touches_band(candle, band_low, band_high) or _body_ratio(candle) < config.JP_MIN_BODY_RATIO:
+        return None
+    reference_volume = float(prior["volume"].median()) if not prior.empty else 0.0
+    volume_ratio = float(candle.volume) / reference_volume if reference_volume > 0 else 1.0
+    if not config.JP_MIN_VOLUME_RATIO <= volume_ratio <= config.JP_MAX_VOLUME_RATIO:
         return None
 
     close = float(candle.close)
@@ -105,6 +140,14 @@ def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool):
 
     candle_open_time = candle.timestamp.to_pydatetime()
     candle_close_time = candle_open_time + timedelta(minutes=config.JP_TIMEFRAME)
+    confirmation = df.iloc[jp_index + 1]
+    if config.JP_REQUIRE_NEXT_PATTERN_CONFIRMATION:
+        if is_bullish_setup:
+            confirmed = float(confirmation.high) > float(candle.high) and float(confirmation.close) > float(candle.high)
+        else:
+            confirmed = float(confirmation.low) < float(candle.low) and float(confirmation.close) < float(candle.low)
+        if not confirmed:
+            return None
     return {
         "strategy": "JP",
         "direction": direction,
@@ -122,6 +165,13 @@ def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool):
         "band_high": band_high,
         "trigger_price": trigger_price,
         "stop_price": stop_price,
+        "structural_stop_price": stop_price,
+        "body_ratio": _body_ratio(candle),
+        "volume_ratio": volume_ratio,
+        "prior_band_touch_count": prior_touch_count,
+        "trend_side_count": trend_side_count,
+        "pattern_confirmation_time": confirmation.timestamp,
+        "pattern_confirmation_status": "CONFIRMED",
         "detected_at": datetime.now(config.TIME_ZONE),
     }
 

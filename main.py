@@ -187,6 +187,16 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         if bar_time < pattern_close:
             return None
 
+    expires_at = setup.get("expires_at")
+    if expires_at and bar_time > datetime.fromisoformat(expires_at):
+        strategy_name = strategy
+        state.log_setup_outcome(setup, "SETUP_EXPIRED", f"expired_at={expires_at}")
+        if strategy_name == "JP":
+            state.remove_jp_setup(security_id)
+        else:
+            state.remove_alpha_setup(security_id)
+        return "SETUP_EXPIRED"
+
     high = float(latest_completed_1m_bar.get("high", 0.0))
     low = float(latest_completed_1m_bar.get("low", 0.0))
     close = float(latest_completed_1m_bar.get("close", 0.0))
@@ -241,6 +251,8 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
     alpha_open_time = setup.get("alpha_open_time") or setup.get("jp_open_time")
     alpha_close_time = setup.get("alpha_close_time") or setup.get("jp_close_time")
     alpha_key = setup.get("alpha_key") or setup.get("jp_key")
+    signal_quality = setup.get("signal_quality", {})
+    pattern_confirmation_time = setup.get("pattern_confirmation_time")
 
     position = engine.enter_trade(
         broker=broker,
@@ -260,6 +272,8 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         alpha_open_time=alpha_open_time,
         alpha_close_time=alpha_close_time,
         alpha_key=alpha_key,
+        signal_quality=signal_quality,
+        pattern_confirmation_time=pattern_confirmation_time,
     )
 
     if position is not None:
@@ -333,19 +347,24 @@ def heartbeat_loop():
 
 def build_scan_candidates():
     snap = state.snapshot()
-    gainers = [{**item, "is_bullish_setup": True} for item in snap.get("top_gainers", [])[:config.TOP_N_GAINERS]]
-    losers = [{**item, "is_bullish_setup": False} for item in snap.get("top_losers", [])[:config.TOP_N_LOSERS]]
-    candidates = gainers + losers
+    now = datetime.now(config.TIME_ZONE).time()
+    morning = datetime.strptime("09:20", "%H:%M").time() <= now <= datetime.strptime("10:30", "%H:%M").time()
+    limit = config.MORNING_MAX_CANDIDATES_PER_SIDE if morning else config.REGULAR_MAX_CANDIDATES_PER_SIDE
+    gainers = [{**item, "is_bullish_setup": True} for item in snap.get("top_gainers", [])[:limit]]
+    candidates = gainers if config.ALPHA_ENABLED else []
     state.add_log(
-        f"Scan universe: LIVE, gainers={len(gainers)}, losers={len(losers)}, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
+        f"Scan universe: LIVE, gainers={len(gainers)}, losers=0, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
     )
     return candidates
 
 
 def build_jp_scan_candidates():
     snap = state.snapshot()
-    gainers = [{**row, "is_bullish_setup": True} for row in snap.get("top_gainers", [])[:config.JP_TOP_N_PER_SIDE]]
-    losers = [{**row, "is_bullish_setup": False} for row in snap.get("top_losers", [])[:config.JP_TOP_N_PER_SIDE]]
+    now = datetime.now(config.TIME_ZONE).time()
+    morning = datetime.strptime("09:20", "%H:%M").time() <= now <= datetime.strptime("10:30", "%H:%M").time()
+    limit = config.MORNING_MAX_CANDIDATES_PER_SIDE if morning else config.REGULAR_MAX_CANDIDATES_PER_SIDE
+    gainers = [{**row, "is_bullish_setup": True} for row in snap.get("top_gainers", [])[:limit] if config.JP_ALLOW_BUY]
+    losers = [{**row, "is_bullish_setup": False} for row in snap.get("top_losers", [])[:limit] if config.JP_ALLOW_SELL]
     return gainers + losers
 
 
@@ -356,6 +375,9 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
     security_id = int(candidate["SECURITY_ID"])
     symbol = candidate["display_name"]
     is_bullish_setup = candidate["is_bullish_setup"]
+    regime = state.snapshot().get("market_regime")
+    if config.JP_REQUIRE_MARKET_REGIME and ((is_bullish_setup and regime != "BULLISH") or (not is_bullish_setup and regime != "BEARISH")):
+        return
 
     if state.jp_signal_count(security_id) >= config.JP_MAX_SIGNALS_PER_SYMBOL_PER_DAY:
         return
@@ -379,7 +401,7 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
 
     now = datetime.now(config.TIME_ZONE)
     age_minutes = (now - result["jp_close_time"]).total_seconds() / 60.0
-    if result["jp_close_time"] > now or age_minutes > config.JP_MAX_AGE_MINUTES:
+    if result["jp_close_time"] > now or age_minutes > config.JP_MAX_ENTRY_MINUTES:
         return
 
     key = f"JP_{security_id}_{result['direction']}_{result['jp_open_time'].isoformat()}"
@@ -409,6 +431,7 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
         "trigger_price": result["trigger_price"], "stop_price": result["stop_price"],
         "smma_band_low": result["band_low"], "smma_band_high": result["band_high"],
         "stop_distance_pct": round(stop_pct, 3), "detected_at": now.isoformat(),
+        "expires_at": (result["jp_close_time"] + timedelta(minutes=config.JP_MAX_ENTRY_MINUTES)).isoformat(),
         "jp_key": key,
     }
     state.set_jp_watchlist_item(security_id, item)
@@ -431,6 +454,11 @@ def scan_candidate(broker, candidate, prev_trade_date):
     security_id = int(candidate["SECURITY_ID"])
     symbol = candidate["display_name"]
     is_bullish_setup = candidate["is_bullish_setup"]
+    if not is_bullish_setup or not config.ALPHA_ALLOW_SELL:
+        if not is_bullish_setup:
+            return
+    if config.ALPHA_REQUIRE_MARKET_BULLISH and state.snapshot().get("market_regime") == "BEARISH":
+        return
 
     if str(security_id) in state.snapshot()["open_positions"]:
         return
@@ -470,6 +498,8 @@ def scan_candidate(broker, candidate, prev_trade_date):
         direction = "BUY" if is_bullish_setup else "SELL"
         alpha_open_time = alpha.timestamp.to_pydatetime()
         alpha_close_time = alpha_open_time + timedelta(minutes=config.ALPHA_TIMEFRAME)
+        trend_volumes = [float(c.volume) for c in result["trend_run"] if float(c.volume) > 0]
+        trend_volume_ratio = float(alpha.volume) / (sum(trend_volumes) / len(trend_volumes)) if trend_volumes else 1.0
         now = datetime.now(config.TIME_ZONE)
         alpha_age_minutes = (now - alpha_close_time).total_seconds() / 60.0
         alpha_key = f"{security_id}_{direction}_{alpha_open_time.isoformat()}"
@@ -477,7 +507,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
         if alpha_close_time > now:
             state.add_log(f"{symbol}: Alpha ignored - pattern candle has not closed yet ({alpha_open_time.isoformat()})")
             return
-        if alpha_age_minutes > config.MAX_ALPHA_AGE_MINUTES:
+        if alpha_age_minutes > config.ALPHA_MAX_ENTRY_MINUTES:
             state.add_log(f"{symbol}: stale Alpha ignored - {alpha_age_minutes:.1f} min old, candle={alpha_open_time.isoformat()}")
             return
         if state.is_expired_alpha(alpha_key):
@@ -502,8 +532,17 @@ def scan_candidate(broker, candidate, prev_trade_date):
             "current_ltp": None,
             "distance_to_trigger_pct": None,
             "hold_expires_at": (alpha_close_time + timedelta(
-                minutes=config.HOLD_CANDLES_PATTERN * config.PATTERN_TIMEFRAME
+                minutes=config.ALPHA_MAX_ENTRY_MINUTES
             )).isoformat(),
+            "expires_at": (alpha_close_time + timedelta(minutes=config.ALPHA_MAX_ENTRY_MINUTES)).isoformat(),
+            "pattern_confirmation_time": result.get("pattern_confirmation_time").isoformat(),
+            "pattern_confirmation_status": "CONFIRMED",
+            "signal_quality": {
+                "trend_volume_ratio": round(trend_volume_ratio, 3),
+                "pullback_volume_ratio": round(trend_volume_ratio, 3),
+                "body_ratio": round(pattern.candle_body_ratio(alpha), 3),
+                "body_to_wick_ratio": round(pattern.body_to_wick_ratio(alpha), 3),
+            },
             "alpha_key": alpha_key,
         })
         if not state.has_alerted(dedup_key):

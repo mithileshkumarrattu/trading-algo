@@ -14,6 +14,7 @@ after close, live-updating during market hours). This means:
 """
 import time
 import logging
+import math
 from datetime import datetime
 
 import config
@@ -184,8 +185,24 @@ def run_full_universe_scan(broker, universe_df):
                 logger.warning("Skipping malformed discovery quote %s: %s", sid_str, exc)
             continue
 
-    gainers = sorted([r for r in rows if r["pct_change"] > 0], key=lambda x: x["pct_change"], reverse=True)[:config.TOP_N_GAINERS]
-    losers = sorted([r for r in rows if r["pct_change"] < 0], key=lambda x: x["pct_change"])[:config.TOP_N_LOSERS]
+    discovered_at = datetime.now(config.TIME_ZONE).isoformat()
+    volume_values = [math.log1p(max(0.0, row["volume"])) for row in rows]
+    max_volume = max(volume_values, default=1.0)
+    for row, log_volume in zip(rows, volume_values):
+        row["discovered_at"] = discovered_at
+        row["priority_score"] = round(
+            0.55 * min(1.0, abs(row["pct_change"]) / config.MAX_PCT_MOVE)
+            + 0.30 * (log_volume / max_volume if max_volume else 0.0)
+            + 0.15,
+            4,
+        )
+
+    gainers = sorted([r for r in rows if r["pct_change"] > 0], key=lambda x: x["priority_score"], reverse=True)[:config.TOP_N_GAINERS]
+    losers = sorted([r for r in rows if r["pct_change"] < 0], key=lambda x: x["priority_score"], reverse=True)[:config.TOP_N_LOSERS]
+    for rank, row in enumerate(gainers, start=1):
+        row["rank"] = rank
+    for rank, row in enumerate(losers, start=1):
+        row["rank"] = rank
 
     state.update({"top_gainers": gainers, "top_losers": losers})
     now = datetime.now(config.TIME_ZONE)
