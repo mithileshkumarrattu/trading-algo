@@ -112,6 +112,7 @@ def run_full_universe_scan(broker, universe_df):
 
     coverage_pct = (len(quotes) / requested_count * 100.0) if requested_count else 0.0
     if coverage_pct < config.MIN_DISCOVERY_QUOTE_COVERAGE_PCT:
+        _last_full_scan = time.time()
         logger.warning(
             "Discovery scan incomplete: %s/%s quotes (%.1f%%); "
             "failed_chunks=%s. Keeping previous movers.",
@@ -127,6 +128,12 @@ def run_full_universe_scan(broker, universe_df):
         return
 
     rows = []
+    below_min_move = 0
+    above_max_move = 0
+    invalid_previous_close = 0
+    blacklisted = 0
+    malformed_quotes = 0
+    eligible = 0
     for sid_str, data in quotes.items():
         try:
             sid = int(sid_str)
@@ -136,12 +143,22 @@ def run_full_universe_scan(broker, universe_df):
             if ltp < config.MIN_PRICE:
                 continue
             prev_close = ltp - net_change
-            pct_change = (net_change / prev_close) * 100.0 if prev_close > 0 else 0.0
+            if prev_close <= 0:
+                invalid_previous_close += 1
+                continue
+            pct_change = (net_change / prev_close) * 100.0
 
-            if abs(pct_change) < config.MIN_PCT_MOVE or abs(pct_change) > config.MAX_PCT_MOVE:
+            if abs(pct_change) < config.MIN_PCT_MOVE:
+                below_min_move += 1
+                continue
+            if abs(pct_change) > config.MAX_PCT_MOVE:
+                above_max_move += 1
                 continue
             if state.is_blacklisted(sid):
+                blacklisted += 1
                 continue
+
+            eligible += 1
 
             row = id_to_row.get(sid)
             display_name = row.DISPLAY_NAME if row is not None else str(sid)
@@ -153,7 +170,10 @@ def run_full_universe_scan(broker, universe_df):
                 "pct_change": round(pct_change, 2),
                 "volume": volume,
             })
-        except Exception:
+        except Exception as exc:
+            malformed_quotes += 1
+            if malformed_quotes <= 3:
+                logger.warning("Skipping malformed discovery quote %s: %s", sid_str, exc)
             continue
 
     gainers = sorted([r for r in rows if r["pct_change"] > 0], key=lambda x: x["pct_change"], reverse=True)[:config.TOP_N_GAINERS]
@@ -182,7 +202,13 @@ def run_full_universe_scan(broker, universe_df):
     _last_full_scan = time.time()
     state.update({"last_discovery_scan": datetime.now(config.TIME_ZONE).isoformat()})
 
-    logger.info(f"Discovery scan complete: {len(gainers)} gainers, {len(losers)} losers qualify (of {len(quotes)} quoted)")
+    logger.info(
+        "Discovery scan complete: %s gainers, %s losers qualify "
+        "(quoted=%s, eligible=%s, below_min=%s, above_max=%s, "
+        "invalid_prev_close=%s, blacklisted=%s, malformed=%s)",
+        len(gainers), len(losers), len(quotes), eligible, below_min_move,
+        above_max_move, invalid_previous_close, blacklisted, malformed_quotes,
+    )
     state.add_log(f"Discovery refreshed: {len(gainers)} gainers / {len(losers)} losers in the {config.MIN_PCT_MOVE}%-{config.MAX_PCT_MOVE}% band")
 
     if _scheduled_mover_message_due():

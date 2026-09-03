@@ -405,19 +405,50 @@ class DhanBroker(metaclass=SingletonMeta):
         if raw_quotes is None:
             return {}
 
+        if raw_quotes:
+            first_security_id, first_quote = next(iter(raw_quotes.items()))
+            logger.info(
+                "Dhan quote sample: security_id=%s keys=%s values=%s",
+                first_security_id,
+                list(first_quote.keys()) if isinstance(first_quote, dict) else type(first_quote).__name__,
+                {
+                    key: first_quote.get(key)
+                    for key in (
+                        "last_price", "lastPrice", "ltp", "net_change", "netChange",
+                        "change", "change_percent", "net_change_percent",
+                        "previous_close", "prev_close", "previousClose", "close",
+                    )
+                    if isinstance(first_quote, dict) and key in first_quote
+                },
+            )
+
         normalized = {}
         for security_id, quote in raw_quotes.items():
             if not isinstance(quote, dict):
                 continue
-            last_price = quote.get("last_price", quote.get("ltp", quote.get("lastPrice")))
-            net_change = quote.get("net_change", quote.get("netChange"))
-            if last_price is None or net_change is None:
+            last_price = quote.get("last_price") or quote.get("lastPrice") or quote.get("ltp")
+            net_change = quote.get("net_change")
+            if net_change is None:
+                net_change = quote.get("netChange", quote.get("change"))
+            prev_close = (
+                quote.get("previous_close") or quote.get("prev_close")
+                or quote.get("previousClose") or quote.get("close")
+            )
+            if last_price is None:
                 continue
-            normalized[str(security_id)] = {
-                "last_price": float(last_price),
-                "net_change": float(net_change),
-                "volume": float(quote.get("volume", 0.0) or 0.0),
-            }
+            try:
+                last_price = float(last_price)
+                if net_change is None and prev_close is not None:
+                    net_change = last_price - float(prev_close)
+                if net_change is None:
+                    continue
+                normalized[str(security_id)] = {
+                    "last_price": last_price,
+                    "net_change": float(net_change),
+                    "volume": float(quote.get("volume", 0.0) or 0.0),
+                }
+            except (TypeError, ValueError):
+                logger.warning("Skipping malformed quote for %s", security_id)
         return normalized
 
     def get_net_change(self, exchange_segment, security_id):
