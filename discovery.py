@@ -53,17 +53,35 @@ def _scheduled_mover_message_due():
 
 def _fetch_batch_quotes(broker, security_ids):
     quotes = {}
+    requested = 0
+    failed_chunks = []
+
     chunk_size = config.DISCOVERY_QUOTE_CHUNK
+
     for i in range(0, len(security_ids), chunk_size):
         chunk = security_ids[i:i + chunk_size]
+        requested += len(chunk)
+
         try:
             res = broker.get_quote_batch(config.EXCHANGE, chunk)
             if res:
                 quotes.update(res)
+            else:
+                failed_chunks.append({
+                    "offset": i,
+                    "count": len(chunk),
+                    "sample": [str(x) for x in chunk[:3]],
+                })
         except Exception:
             logger.exception(f"Quote chunk fetch failed at offset {i}")
+            failed_chunks.append({
+                "offset": i,
+                "count": len(chunk),
+                "sample": [str(x) for x in chunk[:3]],
+            })
         time.sleep(1.05)
-    return quotes
+
+    return quotes, requested, failed_chunks
 
 
 def run_full_universe_scan(broker, universe_df):
@@ -87,11 +105,25 @@ def run_full_universe_scan(broker, universe_df):
 
     id_to_row = {int(r.SECURITY_ID): r for _, r in universe_df.iterrows()}
     sec_ids = list(id_to_row.keys())
-    quotes = _fetch_batch_quotes(broker, sec_ids)
+    quotes, requested_count, failed_chunks = _fetch_batch_quotes(
+        broker,
+        sec_ids,
+    )
 
-    if not quotes:
-        logger.warning("Full universe scan returned no quotes")
-        state.add_log("Discovery scan returned no quotes - will retry")
+    coverage_pct = (len(quotes) / requested_count * 100.0) if requested_count else 0.0
+    if coverage_pct < config.MIN_DISCOVERY_QUOTE_COVERAGE_PCT:
+        logger.warning(
+            "Discovery scan incomplete: %s/%s quotes (%.1f%%); "
+            "failed_chunks=%s. Keeping previous movers.",
+            len(quotes),
+            requested_count,
+            coverage_pct,
+            failed_chunks,
+        )
+        state.add_log(
+            f"Discovery incomplete: {len(quotes)}/{requested_count} "
+            f"quotes ({coverage_pct:.1f}%). Previous movers retained."
+        )
         return
 
     rows = []

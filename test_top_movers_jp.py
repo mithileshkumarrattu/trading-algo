@@ -6,8 +6,26 @@ import state
 import main
 
 
+def test_fetch_batch_quotes_reports_coverage(monkeypatch):
+    monkeypatch.setattr(discovery.config, "DISCOVERY_QUOTE_CHUNK", 2)
+    monkeypatch.setattr(discovery.time, "sleep", lambda _: None)
+
+    class Broker:
+        def get_quote_batch(self, exchange, security_ids):
+            if security_ids[0] == 13:
+                return {}
+            return {str(security_ids[0]): {"last_price": 100.0, "net_change": 1.0}}
+
+    quotes, requested, failed = discovery._fetch_batch_quotes(Broker(), [11, 12, 13, 14])
+
+    assert requested == 4
+    assert len(quotes) == 1
+    assert failed == [{"offset": 2, "count": 2, "sample": ["13", "14"]}]
+
+
 def test_top_movers_throttle_uses_time_interval(monkeypatch):
     monkeypatch.setattr(config, "SEND_TELEGRAM_TOP_MOVERS", True)
+    monkeypatch.setattr(discovery.state, "snapshot", lambda: {})
     monkeypatch.setattr(discovery, "_last_top_movers_telegram_at", 0.0)
     assert discovery.should_send_top_movers() is True
 

@@ -327,10 +327,17 @@ class DhanBroker(metaclass=SingletonMeta):
             len(security_ids),
             security_ids[:3],
         )
+        if time() < self.rate_limited_until:
+            logger.warning("Quote API cooldown active; skipping request")
+            return {}
+
         request = {exchange_segment: [int(s) for s in security_ids]}
         refreshed = False
         for attempt in range(3):
             try:
+                if time() < self.rate_limited_until:
+                    logger.warning("Quote API cooldown active; skipping request")
+                    return {}
                 self._wait_for_api(self.quote_pacer)
                 res = self.dhan.quote_data(securities=request)
                 if not isinstance(res, dict):
