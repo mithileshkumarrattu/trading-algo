@@ -176,6 +176,17 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
     if direction not in ("BUY", "SELL"):
         return None
 
+    pattern_close_time = setup.get("pattern_close_time") or setup.get("jp_close_time") or setup.get("alpha_close_time")
+    bar_was_naive = bar_time.tzinfo is None
+    if bar_was_naive:
+        bar_time = bar_time.replace(tzinfo=config.TIME_ZONE)
+    if pattern_close_time:
+        pattern_close = datetime.fromisoformat(pattern_close_time)
+        if pattern_close.tzinfo is None or bar_was_naive:
+            pattern_close = pattern_close.replace(tzinfo=config.TIME_ZONE)
+        if bar_time < pattern_close:
+            return None
+
     high = float(latest_completed_1m_bar.get("high", 0.0))
     low = float(latest_completed_1m_bar.get("low", 0.0))
     close = float(latest_completed_1m_bar.get("close", 0.0))

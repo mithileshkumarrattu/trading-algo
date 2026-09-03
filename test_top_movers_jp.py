@@ -45,6 +45,30 @@ def test_fetch_batch_quotes_reports_coverage(monkeypatch):
     assert failed == [{"offset": 2, "count": 2, "sample": ["13", "14"]}]
 
 
+def test_fetch_batch_quotes_stops_after_cooldown(monkeypatch):
+    monkeypatch.setattr(discovery.config, "DISCOVERY_QUOTE_CHUNK", 2)
+    monkeypatch.setattr(discovery.time, "sleep", lambda _: None)
+    calls = []
+
+    class Broker:
+        cooldown = False
+
+        def is_quote_cooldown_active(self):
+            return self.cooldown
+
+        def get_quote_batch(self, exchange, security_ids):
+            calls.append(list(security_ids))
+            self.cooldown = True
+            return {}
+
+    quotes, requested, failed = discovery._fetch_batch_quotes(Broker(), [1, 2, 3, 4, 5, 6])
+
+    assert calls == [[1, 2]]
+    assert requested == 6
+    assert len(quotes) == 0
+    assert failed == [{"offset": 0, "count": 2, "sample": ["1", "2"]}]
+
+
 def test_top_movers_throttle_uses_time_interval(monkeypatch):
     monkeypatch.setattr(config, "SEND_TELEGRAM_TOP_MOVERS", True)
     monkeypatch.setattr(discovery.state, "snapshot", lambda: {})
@@ -99,3 +123,43 @@ def test_jp_detection_only_keeps_detector_and_skips_entry(monkeypatch):
     assert result == "JP_TRIGGER_DETECTED_ONLY"
     assert captured["outcome"] == "JP_TRIGGER_DETECTED_ONLY"
     assert captured["removed"] == "42"
+
+
+def test_jp_trigger_routes_to_shared_paper_entry(monkeypatch):
+    monkeypatch.setattr(config, "JP_DETECTION_ONLY", False)
+    captured = {}
+
+    def fake_enter_trade(*args, **kwargs):
+        captured.update(kwargs)
+        return {"order_id": "PAPER-JP"}
+
+    monkeypatch.setattr(main.engine, "enter_trade", fake_enter_trade)
+    monkeypatch.setattr(main.state, "snapshot", lambda: {"open_positions": {}})
+    monkeypatch.setattr(main.state, "set_jp_watchlist_item", lambda sid, item: None)
+    monkeypatch.setattr(main.state, "remove_alpha_setup", lambda sid: None)
+    monkeypatch.setattr(main.state, "remove_jp_setup", lambda sid: None)
+    monkeypatch.setattr(main.state, "log_setup_outcome", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.state, "add_log", lambda *args, **kwargs: None)
+    class DateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 3, 10, 5, tzinfo=tz)
+
+    monkeypatch.setattr(main, "datetime", DateTime)
+
+    setup = {
+        "security_id": "42", "symbol": "TEST", "strategy": "JP", "direction": "BUY",
+        "trigger_price": 101.0, "pattern_high": 101.0, "pattern_low": 99.0,
+        "pattern_open_time": "2026-09-03T10:00:00+05:30",
+        "pattern_close_time": "2026-09-03T10:03:00+05:30", "setup_key": "JP-42",
+    }
+    bar = {"timestamp": datetime(2026, 9, 3, 10, 4, tzinfo=DateTime.now().tzinfo),
+           "open": 100, "high": 102, "low": 100, "close": 101.5}
+
+    class Broker:
+        def get_ltp(self, security_id, exchange):
+            return 101.5
+
+    result = main.process_new_1m_bar_for_setup(Broker(), setup, bar)
+    assert result == "TRADE_ENTERED"
+    assert captured["strategy"] == "JP"

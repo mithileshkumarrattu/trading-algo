@@ -53,14 +53,16 @@ def _scheduled_mover_message_due():
 
 def _fetch_batch_quotes(broker, security_ids):
     quotes = {}
-    requested = 0
+    requested = len(security_ids)
     failed_chunks = []
 
     chunk_size = config.DISCOVERY_QUOTE_CHUNK
 
     for i in range(0, len(security_ids), chunk_size):
         chunk = security_ids[i:i + chunk_size]
-        requested += len(chunk)
+        if hasattr(broker, "is_quote_cooldown_active") and broker.is_quote_cooldown_active():
+            failed_chunks.append({"offset": i, "count": len(chunk), "sample": [str(x) for x in chunk[:3]]})
+            break
 
         try:
             res = broker.get_quote_batch(config.EXCHANGE, chunk)
@@ -72,6 +74,8 @@ def _fetch_batch_quotes(broker, security_ids):
                     "count": len(chunk),
                     "sample": [str(x) for x in chunk[:3]],
                 })
+                if hasattr(broker, "is_quote_cooldown_active") and broker.is_quote_cooldown_active():
+                    break
         except Exception:
             logger.exception(f"Quote chunk fetch failed at offset {i}")
             failed_chunks.append({
@@ -79,7 +83,7 @@ def _fetch_batch_quotes(broker, security_ids):
                 "count": len(chunk),
                 "sample": [str(x) for x in chunk[:3]],
             })
-        time.sleep(1.05)
+        time.sleep(config.QUOTE_BATCH_GAP_SEC)
 
     return quotes, requested, failed_chunks
 

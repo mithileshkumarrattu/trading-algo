@@ -92,13 +92,18 @@ def notify_alpha_candle_detected(symbol, direction, alpha_time, alpha_high, alph
 def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_price, band_low, band_high):
     arrow = "🟢" if direction == "BUY" else "🔴"
     level_name = "JP High" if direction == "BUY" else "JP Low"
+    mode_line = (
+        "<i>Paper execution enabled: a valid completed 1-minute breakout may create a paper order.</i>"
+        if not config.JP_DETECTION_ONLY else
+        "<i>Detection-only paper validation; no JP order will be placed.</i>"
+    )
     send_telegram(
         f"{arrow} <b>{symbol}</b> — JP Pullback setup ({direction})\n"
         f"JP pattern candle: {jp_time}\n"
         f"SMMA band: ₹{band_low:.2f} – ₹{band_high:.2f}\n"
         f"Waiting for the next 1-minute execution candle to cross {level_name}: ₹{trigger_price:.2f}\n"
         f"Structural SL: ₹{stop_price:.2f}\n"
-        f"<i>Detection-only paper validation; no JP order will be placed.</i>"
+        f"{mode_line}"
     )
 
 

@@ -113,10 +113,13 @@ class DhanBroker(metaclass=SingletonMeta):
         pacer.wait()
 
     def _mark_rate_limited(self):
-        current = max(config.RATE_LIMIT_BACKOFF_SEC, self.rate_limited_until - time())
-        backoff = min(current * 2 if current else config.RATE_LIMIT_BACKOFF_SEC,
-                      config.RATE_LIMIT_MAX_BACKOFF_SEC)
-        self.rate_limited_until = time() + backoff
+        self.rate_limited_until = max(
+            self.rate_limited_until,
+            time() + config.QUOTE_RATE_LIMIT_COOLDOWN_SEC,
+        )
+
+    def is_quote_cooldown_active(self):
+        return time() < self.rate_limited_until
 
     def login(self):
         accessToken = get_valid_access_token()
@@ -362,16 +365,16 @@ class DhanBroker(metaclass=SingletonMeta):
                     )
                     return quotes
 
-                logger.warning(
-                    "Dhan quote request failed (attempt %s/3): %s",
-                    attempt + 1,
-                    res.get("data") if isinstance(res, dict) else res,
-                )
+                logger.warning("Dhan quote request failed: %s", res.get("data") if isinstance(res, dict) else res)
                 error_data = res.get("data") if isinstance(res, dict) else None
                 error_text = str(error_data)
                 if "805" in error_text or "904" in error_text or "too many" in error_text.lower():
                     self._mark_rate_limited()
-                    break
+                    logger.warning(
+                        "Dhan quote API rate-limited; pausing quote discovery for %ss",
+                        config.QUOTE_RATE_LIMIT_COOLDOWN_SEC,
+                    )
+                    return {}
                 if not refreshed and ("808" in error_text or "Authentication Failed" in error_text):
                     refreshed = True
                     logger.warning("Dhan quote authentication failed; refreshing access token")
