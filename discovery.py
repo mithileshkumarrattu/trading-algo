@@ -1,14 +1,21 @@
 """
-AlphaCandle - Discovery Engine (WebSocket Live Feed First).
+AlphaCandle - Discovery Engine (Hybrid: REST Snapshot Bootstrap + WebSocket Cache).
 
-Primary Discovery Source:
-- Computes Top Gainers/Losers locally from streaming ticks in broker.liveFeed.
-- Evaluates symbols with ltp > 0, prev_close > 0, and updated within MAX_LIVEFEED_AGE_SEC.
-- Ranks candidates by priority score (55% price move + 30% relative volume + 15% base).
-- Preserves previous mover lists if live WebSocket coverage falls below MIN_WEBSOCKET_COVERAGE_PCT (90%).
-- If streaming ticks lack previous close, performs at most ONE single-request REST quote bootstrap
-  for all universe symbols (Dhan allows up to 1,000 instruments in one request).
-- Never performs recurring full-universe REST quote polling during market hours.
+Architecture:
+1. Startup Snapshot:
+   - One REST Quote API request for the entire universe (up to 1,000 instruments allowed by Dhan).
+   - Seeds LTP, previous close, volume, and net change into broker.liveFeed.
+2. Real-Time Streaming Updates:
+   - WebSocket receives streaming packets (Ticker Data, Quote Data, Previous Close) and updates broker.liveFeed.
+   - Preserves cached LTP and previous close even across transport disconnects / quiet symbols.
+3. Local Ranking & Discovery:
+   - Re-ranks Top 20 Gainers & Top 20 Losers from broker.liveFeed every LOCAL_DISCOVERY_REFRESH_SEC (10s).
+   - Considers any record with updated_at within MAX_LIVEFEED_CACHE_AGE_SEC (300s / 5 min).
+   - Requires MIN_WEBSOCKET_COVERAGE_PCT (50.0%) to update rankings; otherwise retains previous movers.
+4. Optional Periodic Reconciliation:
+   - Evaluates a single-request REST quote reconciliation every REST_RECONCILIATION_INTERVAL_SEC (900s / 15m)
+     only if liveFeed coverage falls below REST_RECONCILIATION_MIN_COVERAGE_PCT (50.0%).
+   - Never calls recurring chunked REST quote scans.
 """
 import time
 import logging
@@ -23,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 _last_top_movers_telegram_at = 0.0
 _last_coverage_log_at = 0.0
-_bootstrap_attempted = False
+_last_reconciliation_at = 0.0
 TOP_MOVERS_TELEGRAM_INTERVAL_SEC = 60 * 60
 
 
@@ -94,12 +101,14 @@ def reconcile_live_subscriptions(broker, gainers, losers):
         broker.reconcile_subscriptions(desired_instruments)
 
 
-def refresh_from_livefeed_full_universe(broker, universe_df):
+def refresh_from_livefeed_full_universe(broker, universe_df, allow_stale_cache=False):
     """
     Primary discovery: ranks Top Gainers and Top Losers directly from
-    in-memory streaming ticks in broker.liveFeed across the universe.
+    in-memory live feed cache in broker.liveFeed across the universe.
+    - Uses DISCOVERY_TICK_MAX_AGE_SEC (60s) for universe mover ranking.
+    - Requires MIN_WEBSOCKET_COVERAGE_PCT (80.0%) to update rankings; retains prior state otherwise.
     """
-    global _last_coverage_log_at, _bootstrap_attempted
+    global _last_coverage_log_at
 
     now_tz = datetime.now(config.TIME_ZONE)
     lock_time = now_tz.replace(
@@ -117,24 +126,12 @@ def refresh_from_livefeed_full_universe(broker, universe_df):
     if universe_count == 0:
         return
 
-    # Check how many symbols have prev_close in liveFeed
     feed_dict = getattr(broker, "liveFeed", {})
-    symbols_with_prev_close = sum(
-        1 for sid in id_to_row.keys()
-        if str(sid) in feed_dict and feed_dict[str(sid)].get("prev_close")
+    max_age_sec = (
+        86400 if allow_stale_cache
+        else getattr(config, "DISCOVERY_TICK_MAX_AGE_SEC", getattr(config, "MAX_LIVEFEED_CACHE_AGE_SEC", 60))
     )
 
-    # If < 50% have prior closes and bootstrap not attempted, perform ONE single-request bootstrap
-    if symbols_with_prev_close < (universe_count * 0.5) and not _bootstrap_attempted:
-        _bootstrap_attempted = True
-        logger.info(
-            "WebSocket feed has %d/%d prior closes; executing ONE-TIME REST prior-close bootstrap",
-            symbols_with_prev_close, universe_count
-        )
-        if hasattr(broker, "bootstrap_prior_closes"):
-            broker.bootstrap_prior_closes(config.EXCHANGE, list(id_to_row.keys()))
-
-    max_age_sec = getattr(config, "MAX_LIVEFEED_AGE_SEC", 15)
     usable_records = {}
     stale_count = 0
     missing_prev_close_count = 0
@@ -151,7 +148,7 @@ def refresh_from_livefeed_full_universe(broker, universe_df):
             missing_prev_close_count += 1
             continue
 
-        updated_at = entry.get("updated_at")
+        updated_at = entry.get("updated_at") or entry.get("ltt")
         if updated_at:
             age = (now_tz - updated_at).total_seconds()
             if age > max_age_sec:
@@ -161,14 +158,13 @@ def refresh_from_livefeed_full_universe(broker, universe_df):
         usable_records[sid] = entry
 
     coverage_pct = (len(usable_records) / universe_count * 100.0) if universe_count else 0.0
-    min_coverage_pct = getattr(config, "MIN_WEBSOCKET_COVERAGE_PCT", 90.0)
+    min_coverage_pct = getattr(config, "MIN_WEBSOCKET_COVERAGE_PCT", 80.0)
 
     if coverage_pct < min_coverage_pct:
-        # Rate-limit coverage logs to at most once per 60 seconds
         if time.time() - _last_coverage_log_at >= 60.0:
             _last_coverage_log_at = time.time()
             logger.info(
-                "WebSocket discovery coverage: %d/%d symbols (%.1f%%, min=%.1f%%, stale=%d, missing_prev_close=%d). "
+                "Live feed discovery coverage: %d/%d symbols (%.1f%%, min=%.1f%%, stale=%d, missing_prev_close=%d). "
                 "Retaining previous movers.",
                 len(usable_records),
                 universe_count,
@@ -178,7 +174,7 @@ def refresh_from_livefeed_full_universe(broker, universe_df):
                 missing_prev_close_count,
             )
             state.add_log(
-                f"WebSocket discovery coverage {coverage_pct:.1f}% ({len(usable_records)}/{universe_count}). "
+                f"Live feed discovery coverage {coverage_pct:.1f}% ({len(usable_records)}/{universe_count}). "
                 f"Previous movers retained."
             )
         return
@@ -221,7 +217,7 @@ def refresh_from_livefeed_full_universe(broker, universe_df):
                 "prev_close": round(prev_close, 2),
                 "pct_change": round(pct_change, 2),
                 "volume": volume,
-                "source": "WEBSOCKET",
+                "source": entry.get("source", "WEBSOCKET"),
             })
         except Exception:
             continue
@@ -248,6 +244,7 @@ def refresh_from_livefeed_full_universe(broker, universe_df):
     state.update({
         "top_gainers": gainers,
         "top_losers": losers,
+        "livefeed_coverage": len(usable_records),
         "last_discovery_scan": now_tz.isoformat(),
     })
 
@@ -273,30 +270,73 @@ def refresh_from_livefeed_full_universe(broker, universe_df):
             logger.exception("Top Movers Telegram notification failed")
 
 
-# Backward compatibility alias
+def check_periodic_reconciliation(broker, universe_df):
+    """
+    Optional safety reconciliation:
+    If live feed coverage falls below REST_RECONCILIATION_MIN_COVERAGE_PCT after
+    REST_RECONCILIATION_INTERVAL_SEC (15m), executes ONE single REST quote snapshot.
+    """
+    global _last_reconciliation_at
+
+    reconciliation_interval = getattr(config, "REST_RECONCILIATION_INTERVAL_SEC", 900)
+    if time.time() - _last_reconciliation_at < reconciliation_interval:
+        return
+
+    feed_dict = getattr(broker, "liveFeed", {})
+    universe_count = len(universe_df)
+    if universe_count == 0:
+        return
+
+    now_tz = datetime.now(config.TIME_ZONE)
+    max_age_sec = getattr(config, "MAX_LIVEFEED_CACHE_AGE_SEC", 300)
+    fresh_count = 0
+    for _, r in universe_df.iterrows():
+        sid_str = str(r["SECURITY_ID"])
+        entry = feed_dict.get(sid_str)
+        if entry and entry.get("ltp") and entry.get("prev_close"):
+            updated_at = entry.get("updated_at")
+            if updated_at and (now_tz - updated_at).total_seconds() <= max_age_sec:
+                fresh_count += 1
+
+    coverage_pct = (fresh_count / universe_count) * 100.0
+    min_reconciliation_coverage = getattr(config, "REST_RECONCILIATION_MIN_COVERAGE_PCT", 50.0)
+
+    if coverage_pct < min_reconciliation_coverage:
+        _last_reconciliation_at = time.time()
+        logger.info(
+            "Live feed coverage low (%.1f%% < %.1f%%); executing periodic REST reconciliation snapshot",
+            coverage_pct, min_reconciliation_coverage
+        )
+        if hasattr(broker, "bootstrap_market_snapshot"):
+            broker.bootstrap_market_snapshot(universe_df["SECURITY_ID"].astype(int).tolist())
+
+
+# Backward compatibility aliases
 def run_full_universe_scan(broker, universe_df):
-    """Delegate to WebSocket-based universe refresh."""
+    """Delegate to live-feed universe refresh."""
     return refresh_from_livefeed_full_universe(broker, universe_df)
 
 
 def refresh_from_livefeed(broker, universe_df):
-    """Delegate to WebSocket-based universe refresh."""
+    """Delegate to live-feed universe refresh."""
     return refresh_from_livefeed_full_universe(broker, universe_df)
 
 
 def discovery_loop(broker, universe_df, run_flag_fn):
     """
     Continuous local feed discovery loop:
-    Evaluates streaming WebSocket ticks every LOCAL_DISCOVERY_REFRESH_SEC (5s).
+    Evaluates streaming cache every LOCAL_DISCOVERY_REFRESH_SEC (10s).
+    Checks periodic single-request reconciliation every 15m if coverage drops.
     """
     refresh_from_livefeed_full_universe(broker, universe_df)
-    refresh_sec = getattr(config, "LOCAL_DISCOVERY_REFRESH_SEC", 5)
+    refresh_sec = getattr(config, "LOCAL_DISCOVERY_REFRESH_SEC", 10)
 
     while run_flag_fn():
         try:
             snap = state.snapshot()
             if snap.get("final_universe_locked", False):
                 break
+            check_periodic_reconciliation(broker, universe_df)
             refresh_from_livefeed_full_universe(broker, universe_df)
         except Exception:
             logger.exception("Error in discovery loop iteration")

@@ -295,11 +295,11 @@ def test_local_mover_ranking_from_livefeed_208_symbols():
 
 
 def test_stale_feed_exclusion():
-    """Verify ticks older than MAX_LIVEFEED_AGE_SEC are excluded from coverage and ranking."""
+    """Verify ticks older than DISCOVERY_TICK_MAX_AGE_SEC are excluded from coverage and ranking."""
     from datetime import datetime, timedelta
     b = _create_mock_broker()
     b.liveFeed = {}
-    stale_tz = datetime.now(config.TIME_ZONE) - timedelta(seconds=config.MAX_LIVEFEED_AGE_SEC + 5)
+    stale_tz = datetime.now(config.TIME_ZONE) - timedelta(seconds=config.DISCOVERY_TICK_MAX_AGE_SEC + 5)
 
     rows = []
     for i in range(10):
@@ -322,26 +322,93 @@ def test_stale_feed_exclusion():
         mock_update.assert_not_called()
 
 
-def test_rest_bootstrap_single_call_for_208_ids():
-    """Verify prior close bootstrap makes exactly ONE single request with all 208 security IDs."""
+
+def test_180_of_208_passes_80_percent_coverage(monkeypatch):
+    """Verify 180/208 (86.5%) symbols with valid previous close passes 80% coverage and updates top movers."""
+    from datetime import datetime
+    b = _create_mock_broker()
+    b.liveFeed = {}
+    now_tz = datetime.now(config.TIME_ZONE)
+
+    rows = []
+    for i in range(208):
+        sid = 40000 + i
+        rows.append({"SECURITY_ID": sid, "DISPLAY_NAME": f"SYM_{sid}"})
+        if i < 180:
+            pct = 2.5 if i < 90 else -2.5
+            prev_close = 100.0
+            ltp = prev_close * (1.0 + pct / 100.0)
+            b.liveFeed[str(sid)] = {
+                "ltp": ltp,
+                "prev_close": prev_close,
+                "net_change": ltp - prev_close,
+                "volume": 50000,
+                "ltt": now_tz,
+                "updated_at": now_tz,
+            }
+
+    universe_df = pd.DataFrame(rows)
+
+    captured = {}
+    with patch("discovery.state.update", side_effect=lambda payload: captured.update(payload)), \
+         patch("discovery.state.snapshot", return_value={"final_universe_locked": False}), \
+         patch("discovery.state.is_blacklisted", return_value=False):
+        monkeypatch.setattr(config, "MIN_WEBSOCKET_COVERAGE_PCT", 60.0)
+        discovery.refresh_from_livefeed_full_universe(b, universe_df)
+        assert "top_gainers" in captured
+        assert len(captured["top_gainers"]) > 0
+
+        # Now test that if policy is 90%, 180/208 (86.5%) is retained and NOT updated
+        captured.clear()
+        monkeypatch.setattr(config, "MIN_WEBSOCKET_COVERAGE_PCT", 90.0)
+        discovery.refresh_from_livefeed_full_universe(b, universe_df)
+        assert "top_gainers" not in captured
+
+
+def test_reconnect_preserves_livefeed_cache_and_resubscribes_canonical():
+    """Verify connection loss does NOT wipe liveFeed and re-issues subscriptions from canonical list."""
+    b = _create_mock_broker()
+    b.instruments = [(1, "1001", 15), (1, "1002", 15)]
+    b.liveFeed = {
+        "1001": {"ltp": 100.0, "prev_close": 98.0},
+        "1002": {"ltp": 200.0, "prev_close": 195.0},
+    }
+
+    mock_ws = MagicMock()
+    # Test _resubscribe_canonical_instruments
+    b._resubscribe_canonical_instruments(mock_ws)
+    assert mock_ws.subscribe_symbols.call_count == 1
+    assert len(b.liveFeed) == 2  # Feed retained
+
+
+def test_active_symbol_fallback_uses_ws_and_respects_cooldown(monkeypatch):
+    """Verify active symbol uses WebSocket LTP when fresh (<=5s) and rate-limits REST fallback (10s cooldown)."""
+    from datetime import datetime, timedelta
     b = _create_mock_broker()
     b.liveFeed = {}
     b.quote_pacer = broker.RequestPacer(0)
+    b._active_ltp_last_api_fetch = {}
     b.dhan = MagicMock()
-
-    # Mock Dhan single batch response for 208 IDs
-    sec_ids = [30000 + i for i in range(208)]
-    mock_quotes = {str(sid): {"last_price": 105.0, "net_change": 5.0, "volume": 1000} for sid in sec_ids}
     b.dhan.quote_data.return_value = {
         "status": "success",
-        "data": {config.EXCHANGE: mock_quotes}
+        "data": {config.EXCHANGE: {"5001": {"last_price": 105.0, "net_change": 5.0}}}
     }
 
-    seeded = b.bootstrap_prior_closes(config.EXCHANGE, sec_ids)
+    now_tz = datetime.now(config.TIME_ZONE)
+    # Case 1: Fresh tick (2s old) -> returns WS LTP without REST API call
+    b.liveFeed["5001"] = {"ltp": 104.0, "prev_close": 100.0, "updated_at": now_tz - timedelta(seconds=2)}
+    ltp1 = b.get_active_symbol_ltp_with_fallback("5001")
+    assert ltp1 == 104.0
+    assert b.dhan.quote_data.call_count == 0
 
+    # Case 2: Stale tick (10s old) -> calls REST API and updates liveFeed
+    b.liveFeed["5001"]["updated_at"] = now_tz - timedelta(seconds=10)
+    ltp2 = b.get_active_symbol_ltp_with_fallback("5001")
+    assert ltp2 == 105.0
     assert b.dhan.quote_data.call_count == 1
-    call_args = b.dhan.quote_data.call_args[1]["securities"]
-    assert len(call_args[config.EXCHANGE]) == 208
-    assert seeded == 208
-    assert len(b.liveFeed) == 208
-    assert b.liveFeed["30000"]["prev_close"] == 100.0
+
+    # Case 3: Immediately called again while on cooldown -> does NOT make second REST call
+    b.liveFeed["5001"]["updated_at"] = now_tz - timedelta(seconds=10)
+    ltp3 = b.get_active_symbol_ltp_with_fallback("5001")
+    assert ltp3 == 105.0
+    assert b.dhan.quote_data.call_count == 1

@@ -770,13 +770,18 @@
             <span class="label">Daily P/L</span>
             <span class="value positive" id="dailyPnlMini">₹0.00</span>
           </div>
+        <div class="metric-row">
           <div class="mini-stat">
-            <span class="label">Open</span>
-            <span class="value" id="openCountMini">0</span>
+            <span class="label">Feed Health</span>
+            <span class="value" id="feedHealthMini" style="font-size: 0.78rem; font-weight: 700;">LIVE</span>
+          </div>
+          <div class="mini-stat">
+            <span class="label">Coverage</span>
+            <span class="value" id="coverageMini" style="font-size: 0.78rem; font-weight: 700;">—</span>
           </div>
         </div>
 
-        <button class="cta" type="button" id="liveButton" style="opacity: 0.6; cursor: default;">Live Feed</button>
+        <button class="cta" type="button" id="liveButton" style="opacity: 0.85; cursor: default;">Live Market Feed</button>
       </div>
     </aside>
 
@@ -856,6 +861,30 @@
             <table>
               <thead><tr><th>Symbol</th><th>Side</th><th>Stage</th><th>JP Time</th><th>Trigger</th><th>SL</th><th>SMMA Band</th></tr></thead>
               <tbody id="jpWatchlistTable"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="stack-card glass" style="grid-column: 1 / -1;">
+          <div class="card-header">
+            <h3>Signal Diagnostics (Why Rejected / Evaluated)</h3>
+            <span class="tag watch">Top 5 Candidates</span>
+          </div>
+          <div class="table-wrap" style="max-height: 280px; overflow-y: auto;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Symbol</th>
+                  <th>Strategy</th>
+                  <th>Side</th>
+                  <th>Rank</th>
+                  <th>Status</th>
+                  <th>Reason</th>
+                  <th>Key Metrics</th>
+                </tr>
+              </thead>
+              <tbody id="diagnosticsTable"></tbody>
             </table>
           </div>
         </article>
@@ -940,7 +969,7 @@
       const tbody = document.getElementById(id);
       if (!tbody) return;
       if (!Array.isArray(rows) || rows.length === 0) {
-        const colspan = id === 'watchlistTable' ? 9 : id === 'jpWatchlistTable' ? 7 : id === 'positionsTable' ? 6 : 4;
+        const colspan = id === 'watchlistTable' ? 9 : id === 'diagnosticsTable' ? 8 : id === 'jpWatchlistTable' ? 7 : id === 'positionsTable' ? 6 : 4;
         tbody.innerHTML = `<tr><td colspan="${colspan}" class="muted" style="padding: 18px; text-align: center;">No data</td></tr>`;
         return;
       }
@@ -1011,6 +1040,29 @@
         const openCount = Object.keys(s.open_positions || {}).length;
         const openCountMini = document.getElementById('openCountMini');
         if (openCountMini) openCountMini.textContent = String(openCount);
+
+        const wsConn = s.websocket_connected;
+        const coverageCount = s.livefeed_coverage || (s.top_gainers || []).length + (s.top_losers || []).length;
+        const uSize = s.universe_size || 208;
+        const coveragePct = Math.round((coverageCount / uSize) * 100);
+
+        const feedHealthMini = document.getElementById('feedHealthMini');
+        if (feedHealthMini) {
+          if (wsConn) {
+            feedHealthMini.textContent = 'ONLINE';
+            feedHealthMini.className = 'value positive';
+          } else {
+            feedHealthMini.textContent = 'DEGRADED';
+            feedHealthMini.className = 'value' + (s.websocket_reconnect_count > 0 ? ' negative' : ' muted');
+          }
+        }
+
+        const coverageMini = document.getElementById('coverageMini');
+        if (coverageMini) {
+          coverageMini.textContent = `${coverageCount}/${uSize} (${coveragePct}%)`;
+          coverageMini.className = 'value ' + (coveragePct >= 50 ? 'positive' : 'muted');
+        }
+
 
         const notificationCount = Math.max(0, (s.logs || []).length > 0 ? 1 : 0);
         document.getElementById('notificationCount').textContent = String(notificationCount);
@@ -1112,6 +1164,25 @@
             <td class="num positive">${fmt(r.target_r2_price)}</td>
           </tr>
         `);
+
+        const diagnostics = (s.signal_diagnostics || []).slice(-20).reverse();
+        fillRows('diagnosticsTable', diagnostics, (r) => {
+          const evalTime = r.evaluated_at ? new Date(r.evaluated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
+          const metricsStr = Object.entries(r.metrics || {}).map(([k, v]) => `${k}=${v}`).join(', ') || '—';
+          const isWaiting = r.status === 'WAITING';
+          return `
+            <tr>
+              <td class="num">${evalTime}</td>
+              <td class="sym-cell">${r.symbol || '—'}</td>
+              <td><span class="tag ${r.strategy === 'ALPHA' ? 'watch' : 'sell'}">${r.strategy || '—'}</span></td>
+              <td><span class="tag ${r.side === 'BUY' ? 'buy' : 'sell'}">${r.side || '—'}</span></td>
+              <td class="num">#${r.rank ?? '—'}</td>
+              <td><span class="tag ${isWaiting ? 'breakout' : 'negative'}">${r.status || '—'}</span></td>
+              <td><code>${r.reason || '—'}</code></td>
+              <td class="num muted" style="text-align: left; font-size: 0.72rem;">${metricsStr}</td>
+            </tr>
+          `;
+        });
 
         const logs = (s.logs || []).slice(-8).reverse();
         document.getElementById('logBox').innerHTML = logs.map((msg) => `<div>${msg}</div>`).join('');

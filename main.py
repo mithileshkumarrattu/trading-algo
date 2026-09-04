@@ -26,6 +26,7 @@ import universe
 import discovery
 import pattern
 import jp_pattern
+import signal_diagnostics
 import engine
 import notifier
 from broker import DhanBroker
@@ -608,10 +609,104 @@ def scan_candidate(broker, candidate, prev_trade_date):
         state.add_log(f"{symbol}: Alpha watch consumed; paper position {position['order_id']} created")
 
 
+_last_diagnostic_3m_boundary: str = ""
+
+
+def evaluate_diagnostics_for_top_candidates(broker, prev_trade_date):
+    """
+    Evaluates signal diagnostics for the top 5 Alpha BUY candidates and top 5 JP BUY/SELL candidates.
+    Runs once per completed 3-minute pattern bar boundary.
+    """
+    global _last_diagnostic_3m_boundary
+    now = datetime.now(config.TIME_ZONE)
+    # Calculate completed 3-minute boundary (e.g. at 10:24:10, last completed boundary is 10:24:00)
+    minute_bucket = (now.minute // 3) * 3
+    boundary_dt = now.replace(minute=minute_bucket, second=0, microsecond=0)
+    boundary_key = boundary_dt.isoformat()
+
+    if _last_diagnostic_3m_boundary == boundary_key:
+        return
+
+    _last_diagnostic_3m_boundary = boundary_key
+    snap = state.snapshot()
+    regime = snap.get("market_regime", "UNKNOWN")
+    gainers = snap.get("top_gainers", [])
+    losers = snap.get("top_losers", [])
+
+    # Top 5 Alpha BUY candidates (from top gainers)
+    top_alpha = gainers[:5]
+    for cand in top_alpha:
+        try:
+            sid = int(cand["SECURITY_ID"])
+            sym = cand.get("display_name", str(sid))
+            candles = get_cached_pattern_candles(broker, sid, prev_trade_date, config.PATTERN_TIMEFRAME)
+            today_candles = None
+            if candles is not None and not candles.empty:
+                today_candles = candles[candles["timestamp"].dt.date == now.date()].copy()
+            diag = signal_diagnostics.diagnose_alpha_candidate(
+                symbol=sym,
+                security_id=sid,
+                candidate_info=cand,
+                today_pattern_candles=today_candles,
+                regime=regime,
+                now=now,
+            )
+            signal_diagnostics.record_diagnostic(diag)
+        except Exception:
+            logger.exception("Error diagnosing Alpha candidate %s", cand.get("display_name"))
+
+    # Top 5 JP BUY candidates (from top gainers)
+    top_jp_buy = gainers[:5]
+    for cand in top_jp_buy:
+        try:
+            sid = int(cand["SECURITY_ID"])
+            sym = cand.get("display_name", str(sid))
+            cand_info = {**cand, "is_bullish_setup": True}
+            candles = get_cached_pattern_candles(broker, sid, prev_trade_date, config.JP_TIMEFRAME)
+            today_candles = None
+            if candles is not None and not candles.empty:
+                today_candles = candles[candles["timestamp"].dt.date == now.date()].copy()
+            diag = signal_diagnostics.diagnose_jp_candidate(
+                symbol=sym,
+                security_id=sid,
+                candidate_info=cand_info,
+                today_pattern_candles=today_candles,
+                regime=regime,
+                now=now,
+            )
+            signal_diagnostics.record_diagnostic(diag)
+        except Exception:
+            logger.exception("Error diagnosing JP BUY candidate %s", cand.get("display_name"))
+
+    # Top 5 JP SELL candidates (from top losers)
+    top_jp_sell = losers[:5]
+    for cand in top_jp_sell:
+        try:
+            sid = int(cand["SECURITY_ID"])
+            sym = cand.get("display_name", str(sid))
+            cand_info = {**cand, "is_bullish_setup": False}
+            candles = get_cached_pattern_candles(broker, sid, prev_trade_date, config.JP_TIMEFRAME)
+            today_candles = None
+            if candles is not None and not candles.empty:
+                today_candles = candles[candles["timestamp"].dt.date == now.date()].copy()
+            diag = signal_diagnostics.diagnose_jp_candidate(
+                symbol=sym,
+                security_id=sid,
+                candidate_info=cand_info,
+                today_pattern_candles=today_candles,
+                regime=regime,
+                now=now,
+            )
+            signal_diagnostics.record_diagnostic(diag)
+        except Exception:
+            logger.exception("Error diagnosing JP SELL candidate %s", cand.get("display_name"))
+
+
 def scan_loop(broker, prev_trade_date):
     while run_flag():
         try:
             if timing.is_entry_allowed():
+                evaluate_diagnostics_for_top_candidates(broker, prev_trade_date)
                 active_setups = state.get_active_alpha_setups() + state.get_active_jp_setups()
                 setups_by_security = {}
                 for setup in active_setups:
@@ -699,12 +794,36 @@ def main():
         broker.subscribe_symbols(batch)
         time.sleep(0.25)
 
+    bootstrap_wait_sec = getattr(config, "WEBSOCKET_BOOTSTRAP_WAIT_SEC", 20)
+    min_prev_close_pct = getattr(config, "MIN_PREV_CLOSE_COVERAGE_PCT", 90.0)
+
     logger.info(
-        "WebSocket feed initialized with %d symbols; waiting %ss initial delay for ticks to populate...",
-        len(subscribe_list) + 1,
-        config.INITIAL_DISCOVERY_DELAY_SEC,
+        "Waiting up to %ss for WebSocket Previous Close packets to populate (%s%% target)...",
+        bootstrap_wait_sec,
+        min_prev_close_pct,
     )
-    time.sleep(config.INITIAL_DISCOVERY_DELAY_SEC)
+    ready = broker.wait_for_prev_close_coverage(
+        expected_count=len(universe_df),
+        minimum_pct=min_prev_close_pct,
+        timeout_sec=bootstrap_wait_sec,
+    )
+
+    if not ready and getattr(config, "ENABLE_QUOTE_BOOTSTRAP", True):
+        logger.info("WebSocket previous close coverage incomplete; executing ONE single REST quote bootstrap...")
+        snapshot = broker.bootstrap_prior_closes_once(
+            universe_df["SECURITY_ID"].astype(int).tolist()
+        )
+        if snapshot:
+            discovery.refresh_from_livefeed_full_universe(
+                broker, universe_df, allow_stale_cache=True,
+            )
+        else:
+            logger.warning("Initial quote bootstrap unavailable; retaining WebSocket-only cache")
+    else:
+        # Prime discovery from WebSocket feed immediately
+        discovery.refresh_from_livefeed_full_universe(
+            broker, universe_df, allow_stale_cache=True,
+        )
 
     prev_trade_date = get_prev_trading_day(broker)
 

@@ -52,6 +52,12 @@ _DEFAULT_STATE = {
     "final_top_gainers": [],
     "final_top_losers": [],
     "final_universe_locked_at": None,
+    "websocket_connected": False,
+    "websocket_last_tick_at": None,
+    "websocket_last_disconnect_at": None,
+    "websocket_reconnect_count": 0,
+    "livefeed_coverage": 0,
+    "signal_diagnostics": [],
 }
 
 
@@ -329,4 +335,13 @@ def increment_jp_signal_count(security_id):
         counts = data.setdefault("jp_symbol_signal_counts", {})
         key = str(security_id)
         counts[key] = int(counts.get(key, 0)) + 1
+        _write_raw(data)
+
+
+def add_signal_diagnostic(diag: dict, max_items: int = 200):
+    with _LOCK:
+        data = _read_raw()
+        diagnostics = data.setdefault("signal_diagnostics", [])
+        diagnostics.append(diag)
+        data["signal_diagnostics"] = diagnostics[-max_items:]
         _write_raw(data)

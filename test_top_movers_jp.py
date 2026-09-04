@@ -189,3 +189,72 @@ def test_jp_trigger_routes_to_shared_paper_entry(monkeypatch):
     result = main.process_new_1m_bar_for_setup(Broker(), setup, bar)
     assert result == "TRADE_ENTERED"
     assert captured["strategy"] == "JP"
+
+
+def test_diagnose_alpha_rejection_reasons():
+    import signal_diagnostics
+    now = datetime(2026, 9, 4, 10, 30, tzinfo=config.TIME_ZONE)
+    cand_info = {"SECURITY_ID": 101, "rank": 1, "pct_change": 2.5, "volume": 50000}
+
+    # Case 1: Market regime bearish rejects Alpha BUY
+    diag_regime = signal_diagnostics.diagnose_alpha_candidate(
+        symbol="SWIGGY",
+        security_id=101,
+        candidate_info=cand_info,
+        today_pattern_candles=pd.DataFrame(),
+        regime="BEARISH",
+        now=now,
+    )
+    assert diag_regime["status"] == "REJECTED"
+    assert diag_regime["reason"] == "MARKET_REGIME_BLOCKED"
+
+    # Case 2: Candle with insufficient trend body-to-wick ratio
+    candles = [
+        {"timestamp": now - timedelta(minutes=15), "open": 100.0, "high": 102.0, "low": 99.5, "close": 101.8, "volume": 1000},
+        {"timestamp": now - timedelta(minutes=12), "open": 101.8, "high": 104.0, "low": 101.5, "close": 103.8, "volume": 1000},
+        # candle with body=1.0, wicks=2.0 (high=105, low=102, open=103, close=104 -> body_ratio = 1/3 = 0.33 < 0.55, body_to_wick = 1/2 = 0.5 < 1.0, not doji since body_ratio 0.33 > 0.18)
+        {"timestamp": now - timedelta(minutes=9), "open": 103.0, "high": 105.0, "low": 102.0, "close": 104.0, "volume": 1000},
+        {"timestamp": now - timedelta(minutes=6), "open": 104.0, "high": 104.2, "low": 102.5, "close": 103.0, "volume": 1000}, # Alpha candidate
+        {"timestamp": now - timedelta(minutes=3), "open": 103.0, "high": 105.0, "low": 102.8, "close": 104.8, "volume": 1000}, # Confirmation
+    ]
+    df = pd.DataFrame(candles)
+    diag_trend = signal_diagnostics.diagnose_alpha_candidate(
+        symbol="SWIGGY",
+        security_id=101,
+        candidate_info=cand_info,
+        today_pattern_candles=df,
+        regime="BULLISH",
+        now=now,
+    )
+    assert diag_trend["status"] == "REJECTED"
+    assert diag_trend["reason"] in ("TREND_BODY_TO_WICK", "TREND_BODY_RATIO", "TREND_DOJI", "TREND_RUN_TOO_SHORT")
+
+
+def test_diagnose_jp_rejection_reasons():
+    import signal_diagnostics
+    now = datetime(2026, 9, 4, 10, 30, tzinfo=config.TIME_ZONE)
+    cand_info = {"SECURITY_ID": 202, "rank": 1, "pct_change": 3.0, "volume": 80000, "is_bullish_setup": True}
+
+    # Case 1: Market regime bearish rejects JP BUY
+    diag_regime = signal_diagnostics.diagnose_jp_candidate(
+        symbol="HAL",
+        security_id=202,
+        candidate_info=cand_info,
+        today_pattern_candles=pd.DataFrame(),
+        regime="BEARISH",
+        now=now,
+    )
+    assert diag_regime["status"] == "REJECTED"
+    assert diag_regime["reason"] == "MARKET_REGIME_BLOCKED"
+
+    # Case 2: Insufficient candles
+    diag_hist = signal_diagnostics.diagnose_jp_candidate(
+        symbol="HAL",
+        security_id=202,
+        candidate_info=cand_info,
+        today_pattern_candles=pd.DataFrame([{"timestamp": now, "high": 100, "low": 90, "open": 95, "close": 98, "volume": 100}]),
+        regime="BULLISH",
+        now=now,
+    )
+    assert diag_hist["status"] == "REJECTED"
+    assert diag_hist["reason"] == "INSUFFICIENT_HISTORY"

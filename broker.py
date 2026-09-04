@@ -20,7 +20,15 @@ from datetime import datetime, timedelta
 from queue import Queue, Empty
 from typing import Any
 
+import warnings
 import pandas as pd
+import state
+
+warnings.filterwarnings(
+    "ignore",
+    category=DeprecationWarning,
+    module=r"dhanhq\.marketfeed",
+)
 
 try:
     from dhanhq import DhanContext, dhanhq, MarketFeed, OrderUpdate
@@ -109,6 +117,7 @@ class DhanBroker(metaclass=SingletonMeta):
         self.data_pacer = RequestPacer(1.0 / config.DATA_API_MAX_REQUESTS_PER_SECOND)
         self.rate_limited_until = 0.0
         self._quote_cooldown_warned_until = 0.0
+        self._active_ltp_last_api_fetch = {}
         self.start = time()
         self.login()
 
@@ -320,19 +329,57 @@ class DhanBroker(metaclass=SingletonMeta):
             logger.exception(f"Error getting LTP for {security_id}")
         return None
 
-    def get_ltp(self, security_id, exchange_segment="NSE_EQ"):
-        security_id = str(security_id)
-        try:
-            if security_id in self.liveFeed:
-                feed = self.liveFeed[security_id]
-                delay = (datetime.now(self.timeZone) - feed["ltt"]).total_seconds()
-                if delay > 120:
-                    return self.get_ltp_from_api(exchange_segment, security_id)
-                return feed["ltp"]
-            return self.get_ltp_from_api(exchange_segment, security_id)
-        except Exception:
-            logger.exception("Error in get_ltp")
+    def get_active_symbol_ltp_with_fallback(self, security_id, exchange_segment="NSE_EQ"):
+        """
+        LTP fetch with strict data freshness for active setups and open positions only.
+        - Uses WebSocket LTP if tick age <= ACTIVE_SYMBOL_TICK_MAX_AGE_SEC (5s).
+        - If stale, makes ONE individually rate-limited REST quote query with a per-symbol
+          cooldown of ACTIVE_SYMBOL_REST_FALLBACK_COOLDOWN_SEC (10s).
+        - Never called for the whole universe.
+        """
+        sid_str = str(security_id)
+        now_dt = datetime.now(self.timeZone)
+        max_active_age = getattr(config, "ACTIVE_SYMBOL_TICK_MAX_AGE_SEC", 5)
+
+        feed = self.liveFeed.get(sid_str)
+        if feed and isinstance(feed, dict) and feed.get("ltp") is not None:
+            updated_at = feed.get("updated_at") or feed.get("ltt")
+            if updated_at:
+                age = (now_dt - updated_at).total_seconds()
+                if age <= max_active_age:
+                    return float(feed["ltp"])
+
+        # Check REST fallback cooldown for this active symbol
+        last_api_time = getattr(self, "_active_ltp_last_api_fetch", {}).get(sid_str, 0.0)
+        fallback_cooldown = getattr(config, "ACTIVE_SYMBOL_REST_FALLBACK_COOLDOWN_SEC", 10)
+
+        if (time() - last_api_time) >= fallback_cooldown:
+            if not hasattr(self, "_active_ltp_last_api_fetch"):
+                self._active_ltp_last_api_fetch = {}
+            self._active_ltp_last_api_fetch[sid_str] = time()
+            api_ltp = self.get_ltp_from_api(exchange_segment, security_id)
+            if api_ltp is not None:
+                existing = self.liveFeed.get(sid_str, {})
+                prev_close = existing.get("prev_close")
+                calc_net_change = (api_ltp - prev_close) if prev_close else existing.get("net_change")
+                self.liveFeed[sid_str] = {
+                    **existing,
+                    "ltp": api_ltp,
+                    "prev_close": prev_close,
+                    "net_change": calc_net_change,
+                    "updated_at": now_dt,
+                    "source": "ACTIVE_REST_FALLBACK",
+                }
+                return api_ltp
+
+        # If on cooldown or API failed, return last known cached LTP if available
+        if feed and feed.get("ltp") is not None:
+            return float(feed["ltp"])
         return None
+
+    def get_ltp(self, security_id, exchange_segment="NSE_EQ"):
+        return self.get_active_symbol_ltp_with_fallback(security_id, exchange_segment)
+
 
     def get_quote_batch(self, exchange_segment, security_ids):
         security_ids = [str(s) for s in security_ids if s is not None]
@@ -652,6 +699,10 @@ class DhanBroker(metaclass=SingletonMeta):
     def get_subscribed_security_ids(self):
         return {str(item[1]) for item in self.instruments}
 
+    @property
+    def desired_instruments(self):
+        return list(self.instruments)
+
     def subscribe_symbols(self, symbols):
         self.cmd_queue.put(("SUB", symbols))
 
@@ -784,6 +835,28 @@ class DhanBroker(metaclass=SingletonMeta):
                 self.stop_event.set()
                 break
 
+    def _resubscribe_canonical_instruments(self, dhanDataws):
+        """Resubscribe all canonical desired instruments in batches <= 100 on new socket connection."""
+        canonical = list(self.instruments)
+        if not canonical:
+            return
+        total_batches = (len(canonical) + WS_MAX_SUBSCRIBE_BATCH - 1) // WS_MAX_SUBSCRIBE_BATCH
+        for idx in range(0, len(canonical), WS_MAX_SUBSCRIBE_BATCH):
+            batch_num = (idx // WS_MAX_SUBSCRIBE_BATCH) + 1
+            batch = canonical[idx:idx + WS_MAX_SUBSCRIBE_BATCH]
+            logger.info(
+                "WebSocket resubscribe batch %d/%d: %d instruments",
+                batch_num,
+                total_batches,
+                len(batch),
+            )
+            if dhanDataws:
+                try:
+                    dhanDataws.subscribe_symbols(batch)
+                except Exception:
+                    logger.warning("Failed to resubscribe batch %d/%d to Dhan MarketFeed", batch_num, total_batches)
+            sleep(0.25)
+
     def _market_feed_worker(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -799,7 +872,10 @@ class DhanBroker(metaclass=SingletonMeta):
                     dhanDataws = FeedClient(str(config.CLIENT_ID), self.accessToken, self.instruments, version)
                 dhanDataws.run_forever()
                 logger.info("AlphaCandle websocket connected")
+                state.update({"websocket_connected": True})
 
+                # Rehydrate canonical desired instruments reliably
+                self._resubscribe_canonical_instruments(dhanDataws)
                 self._drain_websocket_commands(dhanDataws)
                 logger.info("WebSocket connected; subscribed=%d", len(self.instruments))
 
@@ -814,14 +890,24 @@ class DhanBroker(metaclass=SingletonMeta):
                             if healthy_ticks >= 5:
                                 backoff_idx = 0
                     except Exception as exc:
-                        logger.exception(
-                            "Dhan MarketFeed get_data failed: type=%s message=%s",
-                            type(exc).__name__,
-                            exc,
-                        )
+                        exc_name = type(exc).__name__
+                        if "ConnectionClosed" in exc_name or "ConnectionReset" in exc_name:
+                            logger.warning("MarketFeed connection closed: %s. Reconnecting...", exc)
+                        else:
+                            logger.exception("Dhan MarketFeed get_data failed: type=%s message=%s", exc_name, exc)
                         raise
             except Exception as e:
-                logger.error("AlphaCandle websocket error: %s", e)
+                exc_name = type(e).__name__
+                if "ConnectionClosed" in exc_name or "ConnectionReset" in exc_name:
+                    logger.warning("MarketFeed connection lost (%s). Retaining cached feed state.", e)
+                else:
+                    logger.error("AlphaCandle websocket error: %s", e)
+                reconnect_cnt = state.snapshot().get("websocket_reconnect_count", 0) + 1
+                state.update({
+                    "websocket_connected": False,
+                    "websocket_last_disconnect_at": datetime.now(self.timeZone).isoformat(),
+                    "websocket_reconnect_count": reconnect_cnt,
+                })
                 if dhanDataws:
                     try:
                         dhanDataws.close_connection()
@@ -839,77 +925,112 @@ class DhanBroker(metaclass=SingletonMeta):
             if isinstance(entry, dict) and entry.get("ltp") and entry.get("prev_close")
         )
 
-    def bootstrap_prior_closes(self, exchange_segment, security_ids):
+    def count_prev_close_coverage(self, security_ids):
+        """Counts how many of the specified security IDs have a valid prev_close in liveFeed."""
+        return sum(
+            1 for sid in security_ids
+            if str(sid) in self.liveFeed and self.liveFeed[str(sid)].get("prev_close") and self.liveFeed[str(sid)]["prev_close"] > 0
+        )
+
+    def wait_for_prev_close_coverage(self, expected_count, minimum_pct=90.0, timeout_sec=20):
+        """Wait up to timeout_sec for Previous Close packets to populate liveFeed."""
+        required = int(expected_count * (minimum_pct / 100.0))
+        deadline = time() + timeout_sec
+        while time() < deadline:
+            current = self.get_livefeed_coverage()
+            if current >= required:
+                logger.info("Previous close coverage ready: %d/%d (%.1f%% >= %.1f%%)", current, expected_count, (current / expected_count * 100), minimum_pct)
+                return True
+            sleep(0.5)
+        current = self.get_livefeed_coverage()
+        logger.info("Previous close coverage after %ss wait: %d/%d (%.1f%%, target=%.1f%%)", timeout_sec, current, expected_count, (current / expected_count * 100) if expected_count else 0, minimum_pct)
+        return current >= required
+
+    def bootstrap_prior_closes_once(self, security_ids):
+        """Convenience alias for single-pass market snapshot bootstrap."""
+        return self.bootstrap_market_snapshot(security_ids)
+
+
+    def bootstrap_market_snapshot(self, security_ids):
         """
-        Perform exactly ONE single REST quote_data request for all security IDs
-        to seed previous close values in liveFeed if WebSocket packets only provide LTP.
-        Never splits into multiple chunks to respect Dhan 1 req/s quote quota (Dhan allows up to 1000 IDs per call).
+        Perform ONE single REST quote_data request for all F&O security IDs.
+        No retry loops; caller decides when another reconciliation is justified.
+        Populates liveFeed with prior close, LTP, net_change, and volume.
         """
         sec_ids = [int(s) for s in security_ids if s is not None]
         if not sec_ids:
-            return 0
+            return {}
 
-        if time() < self.rate_limited_until:
-            logger.warning("Quote API cooldown active; skipping prior close bootstrap")
-            return 0
+        if self.is_quote_cooldown_active():
+            logger.warning("Quote API cooldown active; skipping market snapshot bootstrap")
+            return {}
 
         logger.info(
-            "Bootstrapping prior closes via single REST quote request: segment=%s total_ids=%d sample=%s",
-            exchange_segment,
+            "Fetching single REST market snapshot: segment=%s total_ids=%d sample=%s",
+            config.EXCHANGE,
             len(sec_ids),
             sec_ids[:3],
         )
 
         try:
             self._wait_for_api(self.quote_pacer)
-            res = self.dhan.quote_data(securities={exchange_segment: sec_ids})
-            if not isinstance(res, dict):
-                logger.warning("Prior close bootstrap unexpected response type: %s", type(res).__name__)
-                return 0
+            request = {config.EXCHANGE: sec_ids}
+            response = self.dhan.quote_data(securities=request)
+            if not isinstance(response, dict):
+                logger.warning("Quote bootstrap returned non-dict response: %s", type(response).__name__)
+                return {}
 
-            if res.get("status") != "success":
-                error_data = res.get("data") if isinstance(res, dict) else None
+            if response.get("status") != "success":
+                error_data = response.get("data") if isinstance(response, dict) else None
                 error_text = str(error_data)
                 if "805" in error_text or "904" in error_text or "too many" in error_text.lower():
                     self._mark_rate_limited()
                     logger.warning(
-                        "Dhan quote API rate-limited during bootstrap; continuing with WebSocket LTP stream. Cooldown=%ss",
+                        "Dhan quote API rate-limited; pausing quote calls for %ss",
                         config.QUOTE_RATE_LIMIT_COOLDOWN_SEC,
                     )
                 else:
-                    logger.warning("Dhan quote bootstrap request failed: %s", error_data)
-                return 0
+                    logger.warning("Quote bootstrap failed: %s", error_data)
+                return {}
 
-            quotes = self._extract_quote_data(res, exchange_segment)
-            seeded = 0
+            quotes = self._extract_quote_data(response, config.EXCHANGE)
             now_dt = datetime.now(self.timeZone)
-            for sid_str, data in quotes.items():
-                last_price = data.get("last_price")
-                net_change = data.get("net_change")
-                volume = data.get("volume", 0.0)
-                prev_close = None
+            for sid_str, quote in quotes.items():
+                last_price = quote.get("last_price")
+                net_change = quote.get("net_change")
+                volume = quote.get("volume", 0.0)
                 if last_price is not None and net_change is not None:
                     prev_close = float(last_price) - float(net_change)
+                else:
+                    prev_close = None
 
-                if prev_close is not None and prev_close > 0:
-                    existing = self.liveFeed.get(sid_str, {})
-                    current_ltp = existing.get("ltp") or last_price
-                    calc_net_change = (current_ltp - prev_close) if current_ltp else net_change
-                    self.liveFeed[sid_str] = {
-                        "ltp": current_ltp,
-                        "prev_close": prev_close,
-                        "net_change": calc_net_change,
-                        "volume": existing.get("volume") or volume,
-                        "ltt": existing.get("ltt") or now_dt,
-                        "updated_at": now_dt,
-                    }
-                    seeded += 1
+                existing = self.liveFeed.get(str(sid_str), {})
+                current_ltp = existing.get("ltp") or last_price
+                calc_net_change = (current_ltp - prev_close) if (current_ltp and prev_close) else net_change
 
-            logger.info("Prior close bootstrap completed: %d/%d symbols seeded", seeded, len(sec_ids))
-            return seeded
+                self.liveFeed[str(sid_str)] = {
+                    **existing,
+                    "ltp": current_ltp,
+                    "prev_close": prev_close if prev_close else existing.get("prev_close"),
+                    "net_change": calc_net_change if calc_net_change is not None else existing.get("net_change"),
+                    "volume": existing.get("volume") or volume,
+                    "ltt": existing.get("ltt") or now_dt,
+                    "updated_at": now_dt,
+                    "source": "REST_BOOTSTRAP",
+                }
+
+            logger.info("Market snapshot bootstrap parsed: %d/%d usable quotes seeded", len(quotes), len(sec_ids))
+            state.update({"livefeed_coverage": len(quotes)})
+            return quotes
         except Exception:
-            logger.exception("Error during prior close bootstrap")
-            return 0
+            logger.exception("Error during market snapshot bootstrap")
+            return {}
+
+    def bootstrap_prior_closes(self, exchange_segment, security_ids):
+        """Backward-compatible wrapper for bootstrap_market_snapshot."""
+        quotes = self.bootstrap_market_snapshot(security_ids)
+        return len(quotes)
+
 
 
     def _data_consumer(self):
