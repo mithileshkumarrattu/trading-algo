@@ -124,6 +124,9 @@ class DhanBroker(metaclass=SingletonMeta):
     def is_quote_cooldown_active(self):
         return time() < self.rate_limited_until
 
+    def quote_cooldown_remaining_sec(self):
+        return max(0.0, self.rate_limited_until - time())
+
     def login(self):
         accessToken = get_valid_access_token()
         self._configure_api_client(accessToken)
@@ -302,8 +305,14 @@ class DhanBroker(metaclass=SingletonMeta):
         try:
             self._wait_for_api(self.quote_pacer)
             res = self.dhan.quote_data(securities={exchange_segment: [int(security_id)]})
-            if res and res.get("status") == "success":
-                return float(res["data"]["data"][exchange_segment][str(security_id)]["last_price"])
+            if res and isinstance(res, dict) and res.get("status") == "success":
+                data = res.get("data", {})
+                nested = data.get("data", data) if isinstance(data, dict) else {}
+                seg_data = nested.get(exchange_segment, {}) if isinstance(nested, dict) else {}
+                sec_info = seg_data.get(str(security_id), {}) if isinstance(seg_data, dict) else {}
+                last_price = sec_info.get("last_price") or sec_info.get("lastPrice") or sec_info.get("ltp")
+                if last_price is not None:
+                    return float(last_price)
         except Exception:
             logger.exception(f"Error getting LTP for {security_id}")
         return None
@@ -637,11 +646,43 @@ class DhanBroker(metaclass=SingletonMeta):
             sleep(2)
         return pd.DataFrame()
 
+    def get_subscribed_security_ids(self):
+        return {str(item[1]) for item in self.instruments}
+
     def subscribe_symbols(self, symbols):
         self.cmd_queue.put(("SUB", symbols))
 
     def unsubscribe_symbols(self, symbols):
         self.cmd_queue.put(("UNSUB", symbols))
+
+    def reconcile_subscriptions(self, desired_instruments):
+        """
+        Safely reconcile WebSocket subscriptions:
+        - Subscribes new instruments in batches <= 100
+        - Unsubscribes removed instruments in batches <= 100 (never unsubscribes Nifty index)
+        - Returns False if desired set matches current subscriptions without enqueuing commands
+        """
+        current_map = {(item[0], str(item[1]), item[2]): item for item in self.instruments}
+        desired_map = {(item[0], str(item[1]), item[2]): item for item in desired_instruments}
+
+        index_key = (MarketFeed.IDX, str(config.INDEX_SECURITY_ID), MarketFeed.Ticker)
+        desired_map[index_key] = (MarketFeed.IDX, str(config.INDEX_SECURITY_ID), MarketFeed.Ticker)
+
+        to_add = [item for key, item in desired_map.items() if key not in current_map]
+        to_remove = [
+            item for key, item in current_map.items()
+            if key not in desired_map and str(item[1]) != str(config.INDEX_SECURITY_ID)
+        ]
+
+        if not to_add and not to_remove:
+            return False
+
+        if to_remove:
+            self.unsubscribe_symbols(to_remove)
+        if to_add:
+            self.subscribe_symbols(to_add)
+
+        return True
 
     def close_connection(self):
         self.cmd_queue.put(("CLOSE", None))
@@ -682,6 +723,45 @@ class DhanBroker(metaclass=SingletonMeta):
                     raise
             self.instruments.extend(batch)
 
+    def _unsubscribe_payload(self, dhanDataws, payload):
+        if not payload:
+            return
+        to_remove_set = {(item[0], str(item[1]), item[2]) for item in payload}
+        seen = set()
+        deduped = []
+        for item in payload:
+            key = (item[0], str(item[1]), item[2])
+            if key in to_remove_set and key not in seen:
+                seen.add(key)
+                deduped.append(item)
+
+        if not deduped:
+            return
+
+        total_batches = (len(deduped) + WS_MAX_SUBSCRIBE_BATCH - 1) // WS_MAX_SUBSCRIBE_BATCH
+        for idx in range(0, len(deduped), WS_MAX_SUBSCRIBE_BATCH):
+            batch_num = (idx // WS_MAX_SUBSCRIBE_BATCH) + 1
+            batch = deduped[idx:idx + WS_MAX_SUBSCRIBE_BATCH]
+            logger.info(
+                "WebSocket unsubscribe batch %d/%d: %d instruments",
+                batch_num,
+                total_batches,
+                len(batch),
+            )
+            if dhanDataws:
+                try:
+                    dhanDataws.unsubscribe_symbols(batch)
+                except Exception:
+                    logger.exception(
+                        "Failed to unsubscribe batch %d/%d from Dhan MarketFeed",
+                        batch_num,
+                        total_batches,
+                    )
+        self.instruments = [
+            item for item in self.instruments
+            if (item[0], str(item[1]), item[2]) not in to_remove_set
+        ]
+
     def _drain_websocket_commands(self, dhanDataws):
         while True:
             try:
@@ -691,17 +771,7 @@ class DhanBroker(metaclass=SingletonMeta):
             if cmd == "SUB":
                 self._subscribe_payload(dhanDataws, payload)
             elif cmd == "UNSUB":
-                if payload:
-                    to_remove = {(item[0], str(item[1]), item[2]) for item in payload}
-                    self.instruments = [
-                        item for item in self.instruments
-                        if (item[0], str(item[1]), item[2]) not in to_remove
-                    ]
-                    if dhanDataws:
-                        try:
-                            dhanDataws.unsubscribe_symbols(payload)
-                        except Exception:
-                            logger.exception("Failed to unsubscribe symbols from Dhan MarketFeed")
+                self._unsubscribe_payload(dhanDataws, payload)
             elif cmd == "CLOSE":
                 if dhanDataws:
                     try:

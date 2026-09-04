@@ -345,16 +345,23 @@ def heartbeat_loop():
         notifier.notify_heartbeat(len(snap["open_positions"]), snap["daily_pnl"], snap["daily_trade_count"])
 
 
+_last_scan_status_log_at = 0.0
+
+
 def build_scan_candidates():
+    global _last_scan_status_log_at
     snap = state.snapshot()
     now = datetime.now(config.TIME_ZONE).time()
     morning = datetime.strptime("09:20", "%H:%M").time() <= now <= datetime.strptime("10:30", "%H:%M").time()
     limit = config.MORNING_MAX_CANDIDATES_PER_SIDE if morning else config.REGULAR_MAX_CANDIDATES_PER_SIDE
     gainers = [{**item, "is_bullish_setup": True} for item in snap.get("top_gainers", [])[:limit]]
     candidates = gainers if config.ALPHA_ENABLED else []
-    state.add_log(
-        f"Scan universe: LIVE, gainers={len(gainers)}, losers=0, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
-    )
+    now_ts = time.time()
+    if now_ts - _last_scan_status_log_at >= 60:
+        state.add_log(
+            f"Scan universe: LIVE, gainers={len(gainers)}, losers=0, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
+        )
+        _last_scan_status_log_at = now_ts
     return candidates
 
 
@@ -676,19 +683,12 @@ def main():
     universe_df = universe.build_fno_universe()
     state.update({"universe_size": len(universe_df)})
 
-    try:
-        from dhanhq import MarketFeed
-        subscribe_list = [(MarketFeed.NSE, str(r["SECURITY_ID"]), MarketFeed.Ticker) for _, r in universe_df.iterrows()]
-    except ImportError:
-        from dhanhq.marketfeed import NSE, Ticker
-        subscribe_list = [(NSE, str(r["SECURITY_ID"]), Ticker) for _, r in universe_df.iterrows()]
     broker.start_websocket()
-    time.sleep(2)
-    WS_SUBSCRIBE_BATCH_SIZE = 100
-    for start in range(0, len(subscribe_list), WS_SUBSCRIBE_BATCH_SIZE):
-        batch = subscribe_list[start:start + WS_SUBSCRIBE_BATCH_SIZE]
-        broker.subscribe_symbols(batch)
-        time.sleep(0.5)
+    logger.info(
+        "WebSocket started with Nifty index; waiting %ss initial delay before discovery scan...",
+        config.INITIAL_DISCOVERY_DELAY_SEC,
+    )
+    time.sleep(config.INITIAL_DISCOVERY_DELAY_SEC)
 
     prev_trade_date = get_prev_trading_day(broker)
 

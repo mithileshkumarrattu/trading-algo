@@ -24,6 +24,7 @@ import notifier
 logger = logging.getLogger(__name__)
 
 _last_full_scan = 0.0
+_next_discovery_attempt_at = 0.0
 _last_top_movers_telegram_at = 0.0
 TOP_MOVERS_TELEGRAM_INTERVAL_SEC = 60 * 60
 
@@ -95,7 +96,10 @@ def run_full_universe_scan(broker, universe_df):
     computes % change (works any time of day, market open or closed) -
     then ranks and pushes Top-10 gainers/losers straight into state.
     """
-    global _last_full_scan
+    global _last_full_scan, _next_discovery_attempt_at
+
+    if time.time() < _next_discovery_attempt_at:
+        return
 
     now = datetime.now(config.TIME_ZONE)
     lock_time = now.replace(
@@ -117,18 +121,30 @@ def run_full_universe_scan(broker, universe_df):
 
     coverage_pct = (len(quotes) / requested_count * 100.0) if requested_count else 0.0
     if coverage_pct < config.MIN_DISCOVERY_QUOTE_COVERAGE_PCT:
+        remaining_cooldown = (
+            broker.quote_cooldown_remaining_sec()
+            if hasattr(broker, "quote_cooldown_remaining_sec")
+            else (max(0.0, broker.rate_limited_until - time.time()) if hasattr(broker, "rate_limited_until") else 0.0)
+        )
+        retry_after = max(
+            getattr(config, "DISCOVERY_FAILURE_RETRY_SEC", 180),
+            remaining_cooldown,
+        )
+
         _last_full_scan = time.time()
+        _next_discovery_attempt_at = time.time() + retry_after
+
         logger.warning(
-            "Discovery scan incomplete: %s/%s quotes (%.1f%%); "
-            "failed_chunks=%s. Keeping previous movers.",
+            "Discovery scan incomplete: %s/%s quotes (%.1f%%). "
+            "Keeping previous movers; retry in %.0fs.",
             len(quotes),
             requested_count,
             coverage_pct,
-            failed_chunks,
+            retry_after,
         )
         state.add_log(
-            f"Discovery incomplete: {len(quotes)}/{requested_count} "
-            f"quotes ({coverage_pct:.1f}%). Previous movers retained."
+            f"Discovery incomplete: {len(quotes)}/{requested_count} quotes. "
+            f"Previous movers retained; retry in {retry_after:.0f}s."
         )
         return
 
@@ -225,6 +241,7 @@ def run_full_universe_scan(broker, universe_df):
             f"gainers / {len(losers[:config.TOP_N_LOSERS])} losers"
         )
     _last_full_scan = time.time()
+    _next_discovery_attempt_at = _last_full_scan + config.DISCOVERY_FULL_SCAN_INTERVAL_SEC
     state.update({"last_discovery_scan": datetime.now(config.TIME_ZONE).isoformat()})
 
     logger.info(
@@ -237,6 +254,8 @@ def run_full_universe_scan(broker, universe_df):
     )
     state.add_log(f"Discovery refreshed: {len(gainers)} gainers / {len(losers)} losers in the {config.MIN_PCT_MOVE}%-{config.MAX_PCT_MOVE}% band")
 
+    reconcile_live_subscriptions(broker, gainers, losers)
+
     if _scheduled_mover_message_due():
         try:
             notifier.notify_top_movers(gainers, losers)
@@ -245,6 +264,49 @@ def run_full_universe_scan(broker, universe_df):
             state.update({"last_top_movers_telegram_at": datetime.now(config.TIME_ZONE).isoformat()})
         except Exception:
             logger.exception("Top Movers Telegram notification failed")
+
+
+def reconcile_live_subscriptions(broker, gainers, losers):
+    """
+    Reconcile active WebSocket subscriptions after a successful full discovery scan.
+    Subscribes:
+      - Nifty 50 index
+      - Top WS_TOP_MOVERS_PER_SIDE gainers
+      - Top WS_TOP_MOVERS_PER_SIDE losers
+      - Active Alpha/JP setups and open positions
+    Unsubscribes symbols no longer in this set.
+    """
+    snap = state.snapshot()
+    top_limit = getattr(config, "WS_TOP_MOVERS_PER_SIDE", 10)
+    top_movers = (
+        gainers[:top_limit]
+        + losers[:top_limit]
+    )
+
+    desired_ids = {str(r["SECURITY_ID"]) for r in top_movers if isinstance(r, dict) and "SECURITY_ID" in r}
+
+    # Include any active setup / position security IDs
+    for key in ("watchlist", "alpha_watchlist", "jp_watchlist", "open_positions"):
+        items = snap.get(key, {})
+        if isinstance(items, dict):
+            for sid in items.keys():
+                desired_ids.add(str(sid))
+        elif isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict) and "security_id" in item:
+                    desired_ids.add(str(item["security_id"]))
+                elif isinstance(item, (str, int)):
+                    desired_ids.add(str(item))
+
+    # NSE = 1, Ticker = 15, IDX = 0
+    desired_instruments = [
+        (0, str(config.INDEX_SECURITY_ID), 15)
+    ]
+    for sid in sorted(desired_ids):
+        desired_instruments.append((1, str(sid), 15))
+
+    if hasattr(broker, "reconcile_subscriptions"):
+        broker.reconcile_subscriptions(desired_instruments)
 
 
 def refresh_from_livefeed(broker, universe_df):
@@ -289,7 +351,8 @@ def discovery_loop(broker, universe_df, run_flag_fn):
             snap = state.snapshot()
             if snap.get("final_universe_locked", False):
                 break
-            if time.time() - _last_full_scan > config.DISCOVERY_FULL_SCAN_INTERVAL_SEC:
+            now_ts = time.time()
+            if now_ts >= _next_discovery_attempt_at:
                 run_full_universe_scan(broker, universe_df)
             else:
                 refresh_from_livefeed(broker, universe_df)
