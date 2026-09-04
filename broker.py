@@ -47,6 +47,9 @@ logger = logging.getLogger(__name__)
 _malformed_candle_warned_at = {}
 _candle_retry_after = {}
 
+WS_MAX_SUBSCRIBE_BATCH = 100
+WS_RECONNECT_DELAYS = [3, 5, 10, 20, 30]
+
 
 class RequestPacer:
     def __init__(self, min_interval_sec: float):
@@ -147,7 +150,7 @@ class DhanBroker(metaclass=SingletonMeta):
         if not isinstance(response, dict):
             return False
         response_text = str(response)
-        return "DH-906" in response_text or "Invalid Token" in response_text or "Authentication Failed" in response_text
+        return "DH-906" in response_text or "DH-808" in response_text or "Invalid Token" in response_text or "Authentication Failed" in response_text
 
     def _configure_api_client(self, access_token):
         self.accessToken = access_token
@@ -490,6 +493,7 @@ class DhanBroker(metaclass=SingletonMeta):
         from_str = from_dt.strftime("%Y-%m-%d")
         to_dt = to_dt or datetime.now()
         to_str = to_dt.strftime("%Y-%m-%d")
+        refreshed = False
         for _ in range(3):
             try:
                 self._wait_for_api(self.data_pacer)
@@ -498,6 +502,19 @@ class DhanBroker(metaclass=SingletonMeta):
                     instrument_type=instrument_type, from_date=from_str, to_date=to_str,
                     interval=timeframe,
                 )
+                if not isinstance(res, dict) or res.get("status") != "success":
+                    if not refreshed and self._is_auth_failure(res):
+                        refreshed = True
+                        logger.warning("Intraday candle request authentication failed; refreshing access token once")
+                        try:
+                            self._configure_api_client(get_valid_access_token(force_refresh=True))
+                            continue
+                        except Exception:
+                            logger.exception("Dhan access-token refresh failed during intraday candle retry")
+                    return _reject_candle_response(
+                        security_id, timeframe, f"failed: {res.get('data') if isinstance(res, dict) else res}"
+                    )
+
                 data = res.get("data")
                 if not data or not isinstance(data, dict):
                     return _reject_candle_response(security_id, timeframe, "returned empty or malformed data")
@@ -579,6 +596,7 @@ class DhanBroker(metaclass=SingletonMeta):
     def get_historical_daily_candles(self, security_id, exchange_segment, instrument_type, from_dt, to_dt, tz="Asia/Kolkata"):
         from_str = from_dt.strftime("%Y-%m-%d")
         to_str = to_dt.strftime("%Y-%m-%d")
+        refreshed = False
         for _ in range(5):
             try:
                 self._wait_for_api(self.data_pacer)
@@ -592,6 +610,14 @@ class DhanBroker(metaclass=SingletonMeta):
                         security_id,
                         res.get("data") if isinstance(res, dict) else res,
                     )
+                    if not refreshed and self._is_auth_failure(res):
+                        refreshed = True
+                        logger.warning("Historical candle request authentication failed; refreshing access token once")
+                        try:
+                            self._configure_api_client(get_valid_access_token(force_refresh=True))
+                            continue
+                        except Exception:
+                            logger.exception("Dhan access-token refresh failed during historical candle retry")
                     return pd.DataFrame()
                 candle_data = res.get("data")
                 if not isinstance(candle_data, (dict, list)):
@@ -621,11 +647,76 @@ class DhanBroker(metaclass=SingletonMeta):
         self.cmd_queue.put(("CLOSE", None))
         self.stop_event.set()
 
+    def _subscribe_payload(self, dhanDataws, payload):
+        if not payload:
+            return
+        existing = {(item[0], str(item[1]), item[2]) for item in self.instruments}
+        new_symbols = []
+        for item in payload:
+            key = (item[0], str(item[1]), item[2])
+            if key not in existing:
+                existing.add(key)
+                new_symbols.append(item)
+        if not new_symbols:
+            return
+
+        total_batches = (len(new_symbols) + WS_MAX_SUBSCRIBE_BATCH - 1) // WS_MAX_SUBSCRIBE_BATCH
+        for idx in range(0, len(new_symbols), WS_MAX_SUBSCRIBE_BATCH):
+            batch_num = (idx // WS_MAX_SUBSCRIBE_BATCH) + 1
+            batch = new_symbols[idx:idx + WS_MAX_SUBSCRIBE_BATCH]
+            logger.info(
+                "WebSocket subscribe batch %d/%d: %d instruments",
+                batch_num,
+                total_batches,
+                len(batch),
+            )
+            if dhanDataws:
+                try:
+                    dhanDataws.subscribe_symbols(batch)
+                except Exception:
+                    logger.exception(
+                        "Failed to subscribe batch %d/%d to Dhan MarketFeed",
+                        batch_num,
+                        total_batches,
+                    )
+                    raise
+            self.instruments.extend(batch)
+
+    def _drain_websocket_commands(self, dhanDataws):
+        while True:
+            try:
+                cmd, payload = self.cmd_queue.get_nowait()
+            except Empty:
+                break
+            if cmd == "SUB":
+                self._subscribe_payload(dhanDataws, payload)
+            elif cmd == "UNSUB":
+                if payload:
+                    to_remove = {(item[0], str(item[1]), item[2]) for item in payload}
+                    self.instruments = [
+                        item for item in self.instruments
+                        if (item[0], str(item[1]), item[2]) not in to_remove
+                    ]
+                    if dhanDataws:
+                        try:
+                            dhanDataws.unsubscribe_symbols(payload)
+                        except Exception:
+                            logger.exception("Failed to unsubscribe symbols from Dhan MarketFeed")
+            elif cmd == "CLOSE":
+                if dhanDataws:
+                    try:
+                        dhanDataws.close_connection()
+                    except Exception:
+                        pass
+                self.stop_event.set()
+                break
+
     def _market_feed_worker(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         version = "v2"
         dhanDataws = None
+        backoff_idx = 0
         while not self.stop_event.is_set():
             try:
                 logger.info("AlphaCandle websocket connecting...")
@@ -636,35 +727,37 @@ class DhanBroker(metaclass=SingletonMeta):
                 dhanDataws.run_forever()
                 logger.info("AlphaCandle websocket connected")
 
+                self._drain_websocket_commands(dhanDataws)
+                logger.info("WebSocket connected; subscribed=%d", len(self.instruments))
+
+                healthy_ticks = 0
                 while not self.stop_event.is_set():
+                    self._drain_websocket_commands(dhanDataws)
                     try:
                         tick = dhanDataws.get_data()
                         if tick:
                             self.data_queue.put(tick)
-                    except Exception:
-                        raise Exception("Feed dropped")
-
-                    try:
-                        cmd, payload = self.cmd_queue.get_nowait()
-                        if cmd == "SUB":
-                            dhanDataws.subscribe_symbols(payload)
-                            self.instruments.extend(payload)
-                        elif cmd == "UNSUB":
-                            dhanDataws.unsubscribe_symbols(payload)
-                        elif cmd == "CLOSE":
-                            dhanDataws.close_connection()
-                            self.stop_event.set()
-                            break
-                    except Empty:
-                        pass
+                            healthy_ticks += 1
+                            if healthy_ticks >= 5:
+                                backoff_idx = 0
+                    except Exception as exc:
+                        logger.exception(
+                            "Dhan MarketFeed get_data failed: type=%s message=%s",
+                            type(exc).__name__,
+                            exc,
+                        )
+                        raise
             except Exception as e:
-                logger.error(f"AlphaCandle websocket error: {e}")
+                logger.error("AlphaCandle websocket error: %s", e)
                 if dhanDataws:
                     try:
                         dhanDataws.close_connection()
                     except Exception:
                         pass
-                sleep(3)
+                delay = WS_RECONNECT_DELAYS[min(backoff_idx, len(WS_RECONNECT_DELAYS) - 1)]
+                backoff_idx += 1
+                logger.info("Reconnecting websocket in %ss (backoff level %d)...", delay, backoff_idx)
+                sleep(delay)
 
     def _data_consumer(self):
         while not self.stop_event.is_set():

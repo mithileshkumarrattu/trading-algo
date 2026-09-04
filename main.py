@@ -684,7 +684,11 @@ def main():
         subscribe_list = [(NSE, str(r["SECURITY_ID"]), Ticker) for _, r in universe_df.iterrows()]
     broker.start_websocket()
     time.sleep(2)
-    broker.subscribe_symbols(subscribe_list)
+    WS_SUBSCRIBE_BATCH_SIZE = 100
+    for start in range(0, len(subscribe_list), WS_SUBSCRIBE_BATCH_SIZE):
+        batch = subscribe_list[start:start + WS_SUBSCRIBE_BATCH_SIZE]
+        broker.subscribe_symbols(batch)
+        time.sleep(0.5)
 
     prev_trade_date = get_prev_trading_day(broker)
 
