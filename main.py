@@ -684,8 +684,24 @@ def main():
     state.update({"universe_size": len(universe_df)})
 
     broker.start_websocket()
+    try:
+        from dhanhq import MarketFeed
+        mode = getattr(MarketFeed, "Quote", 17)
+        subscribe_list = [(MarketFeed.NSE, str(r["SECURITY_ID"]), mode) for _, r in universe_df.iterrows()]
+    except ImportError:
+        from dhanhq.marketfeed import NSE
+        subscribe_list = [(NSE, str(r["SECURITY_ID"]), 17) for _, r in universe_df.iterrows()]
+
+    logger.info("Subscribing %d F&O universe symbols on WebSocket (Quote Data mode)...", len(subscribe_list))
+    WS_SUBSCRIBE_BATCH_SIZE = 100
+    for start in range(0, len(subscribe_list), WS_SUBSCRIBE_BATCH_SIZE):
+        batch = subscribe_list[start:start + WS_SUBSCRIBE_BATCH_SIZE]
+        broker.subscribe_symbols(batch)
+        time.sleep(0.25)
+
     logger.info(
-        "WebSocket started with Nifty index; waiting %ss initial delay before discovery scan...",
+        "WebSocket feed initialized with %d symbols; waiting %ss initial delay for ticks to populate...",
+        len(subscribe_list) + 1,
         config.INITIAL_DISCOVERY_DELAY_SEC,
     )
     time.sleep(config.INITIAL_DISCOVERY_DELAY_SEC)

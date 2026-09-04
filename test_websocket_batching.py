@@ -21,6 +21,7 @@ def _create_mock_broker():
     instance.cmd_queue = Queue()
     instance.data_queue = Queue()
     instance.rate_limited_until = 0.0
+    instance.timeZone = config.TIME_ZONE
     return instance
 
 
@@ -235,12 +236,112 @@ def test_successful_discovery_subscribes_top_movers_and_active():
 
 
 def test_incomplete_discovery_creates_no_subscription_calls():
-    """Verify incomplete discovery returns early and creates no subscription updates."""
+    """Verify discovery with coverage < 90% retains prior movers without throwing errors."""
     b = _create_mock_broker()
-    universe_df = pd.DataFrame([{"SECURITY_ID": i} for i in range(10)])
+    b.liveFeed = {}  # 0% coverage
+    universe_df = pd.DataFrame([{"SECURITY_ID": 1000 + i, "DISPLAY_NAME": f"SYM_{i}"} for i in range(10)])
 
-    # Force _fetch_batch_quotes to return empty
-    with patch("discovery._fetch_batch_quotes", return_value=({}, 10, [{"offset": 0, "count": 10, "sample": ["0"]}])):
-        with patch.object(b, "reconcile_subscriptions") as mock_reconcile:
-            discovery.run_full_universe_scan(b, universe_df)
-            mock_reconcile.assert_not_called()
+    with patch("discovery.state.snapshot", return_value={"top_gainers": [{"SECURITY_ID": 1000}], "top_losers": []}), \
+         patch("discovery.state.update") as mock_update:
+        discovery.refresh_from_livefeed_full_universe(b, universe_df)
+        mock_update.assert_not_called()
+
+
+def test_local_mover_ranking_from_livefeed_208_symbols():
+    """Verify local mover ranking correctly identifies top gainers & losers for 208 mock symbols."""
+    from datetime import datetime
+    b = _create_mock_broker()
+    b.liveFeed = {}
+    now_tz = datetime.now(config.TIME_ZONE)
+
+    rows = []
+    for i in range(208):
+        sid = 10000 + i
+        rows.append({"SECURITY_ID": sid, "DISPLAY_NAME": f"SYM_{sid}"})
+        # Half gainers, half losers
+        prev_close = 100.0
+        pct = 2.0 if i < 104 else -2.0
+        ltp = prev_close * (1.0 + pct / 100.0)
+        b.liveFeed[str(sid)] = {
+            "ltp": ltp,
+            "prev_close": prev_close,
+            "net_change": ltp - prev_close,
+            "volume": 100000.0 + i * 1000,
+            "ltt": now_tz,
+            "updated_at": now_tz,
+        }
+
+    universe_df = pd.DataFrame(rows)
+
+    captured_updates = {}
+    def mock_update(payload):
+        captured_updates.update(payload)
+
+    with patch("discovery.state.update", side_effect=mock_update), \
+         patch("discovery.state.snapshot", return_value={"final_universe_locked": False}), \
+         patch("discovery.state.is_blacklisted", return_value=False):
+        discovery.refresh_from_livefeed_full_universe(b, universe_df)
+
+    assert "top_gainers" in captured_updates
+    assert "top_losers" in captured_updates
+    gainers = captured_updates["top_gainers"]
+    losers = captured_updates["top_losers"]
+
+    assert len(gainers) == config.TOP_N_GAINERS  # 20
+    assert len(losers) == config.TOP_N_LOSERS    # 20
+    assert all(g["pct_change"] > 0 for g in gainers)
+    assert all(l["pct_change"] < 0 for l in losers)
+    assert all(g["source"] == "WEBSOCKET" for g in gainers)
+
+
+def test_stale_feed_exclusion():
+    """Verify ticks older than MAX_LIVEFEED_AGE_SEC are excluded from coverage and ranking."""
+    from datetime import datetime, timedelta
+    b = _create_mock_broker()
+    b.liveFeed = {}
+    stale_tz = datetime.now(config.TIME_ZONE) - timedelta(seconds=config.MAX_LIVEFEED_AGE_SEC + 5)
+
+    rows = []
+    for i in range(10):
+        sid = 20000 + i
+        rows.append({"SECURITY_ID": sid, "DISPLAY_NAME": f"SYM_{sid}"})
+        b.liveFeed[str(sid)] = {
+            "ltp": 105.0,
+            "prev_close": 100.0,
+            "net_change": 5.0,
+            "volume": 50000.0,
+            "ltt": stale_tz,
+            "updated_at": stale_tz,
+        }
+
+    universe_df = pd.DataFrame(rows)
+
+    with patch("discovery.state.snapshot", return_value={"top_gainers": []}), \
+         patch("discovery.state.update") as mock_update:
+        discovery.refresh_from_livefeed_full_universe(b, universe_df)
+        mock_update.assert_not_called()
+
+
+def test_rest_bootstrap_single_call_for_208_ids():
+    """Verify prior close bootstrap makes exactly ONE single request with all 208 security IDs."""
+    b = _create_mock_broker()
+    b.liveFeed = {}
+    b.quote_pacer = broker.RequestPacer(0)
+    b.dhan = MagicMock()
+
+    # Mock Dhan single batch response for 208 IDs
+    sec_ids = [30000 + i for i in range(208)]
+    mock_quotes = {str(sid): {"last_price": 105.0, "net_change": 5.0, "volume": 1000} for sid in sec_ids}
+    b.dhan.quote_data.return_value = {
+        "status": "success",
+        "data": {config.EXCHANGE: mock_quotes}
+    }
+
+    seeded = b.bootstrap_prior_closes(config.EXCHANGE, sec_ids)
+
+    assert b.dhan.quote_data.call_count == 1
+    call_args = b.dhan.quote_data.call_args[1]["securities"]
+    assert len(call_args[config.EXCHANGE]) == 208
+    assert seeded == 208
+    assert len(b.liveFeed) == 208
+    assert b.liveFeed["30000"]["prev_close"] == 100.0

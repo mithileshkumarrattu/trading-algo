@@ -34,6 +34,9 @@ except ImportError:
         IDX = 0
         NSE = 1
         Ticker = 15
+        Quote = 17
+        Depth = 19
+        Full = 21
 
     DhanContext = None
     DhanSDK_LEGACY = False
@@ -829,17 +832,159 @@ class DhanBroker(metaclass=SingletonMeta):
                 logger.info("Reconnecting websocket in %ss (backoff level %d)...", delay, backoff_idx)
                 sleep(delay)
 
+    def get_livefeed_coverage(self):
+        """Returns the number of symbols currently having valid LTP and previous_close."""
+        return sum(
+            1 for entry in self.liveFeed.values()
+            if isinstance(entry, dict) and entry.get("ltp") and entry.get("prev_close")
+        )
+
+    def bootstrap_prior_closes(self, exchange_segment, security_ids):
+        """
+        Perform exactly ONE single REST quote_data request for all security IDs
+        to seed previous close values in liveFeed if WebSocket packets only provide LTP.
+        Never splits into multiple chunks to respect Dhan 1 req/s quote quota (Dhan allows up to 1000 IDs per call).
+        """
+        sec_ids = [int(s) for s in security_ids if s is not None]
+        if not sec_ids:
+            return 0
+
+        if time() < self.rate_limited_until:
+            logger.warning("Quote API cooldown active; skipping prior close bootstrap")
+            return 0
+
+        logger.info(
+            "Bootstrapping prior closes via single REST quote request: segment=%s total_ids=%d sample=%s",
+            exchange_segment,
+            len(sec_ids),
+            sec_ids[:3],
+        )
+
+        try:
+            self._wait_for_api(self.quote_pacer)
+            res = self.dhan.quote_data(securities={exchange_segment: sec_ids})
+            if not isinstance(res, dict):
+                logger.warning("Prior close bootstrap unexpected response type: %s", type(res).__name__)
+                return 0
+
+            if res.get("status") != "success":
+                error_data = res.get("data") if isinstance(res, dict) else None
+                error_text = str(error_data)
+                if "805" in error_text or "904" in error_text or "too many" in error_text.lower():
+                    self._mark_rate_limited()
+                    logger.warning(
+                        "Dhan quote API rate-limited during bootstrap; continuing with WebSocket LTP stream. Cooldown=%ss",
+                        config.QUOTE_RATE_LIMIT_COOLDOWN_SEC,
+                    )
+                else:
+                    logger.warning("Dhan quote bootstrap request failed: %s", error_data)
+                return 0
+
+            quotes = self._extract_quote_data(res, exchange_segment)
+            seeded = 0
+            now_dt = datetime.now(self.timeZone)
+            for sid_str, data in quotes.items():
+                last_price = data.get("last_price")
+                net_change = data.get("net_change")
+                volume = data.get("volume", 0.0)
+                prev_close = None
+                if last_price is not None and net_change is not None:
+                    prev_close = float(last_price) - float(net_change)
+
+                if prev_close is not None and prev_close > 0:
+                    existing = self.liveFeed.get(sid_str, {})
+                    current_ltp = existing.get("ltp") or last_price
+                    calc_net_change = (current_ltp - prev_close) if current_ltp else net_change
+                    self.liveFeed[sid_str] = {
+                        "ltp": current_ltp,
+                        "prev_close": prev_close,
+                        "net_change": calc_net_change,
+                        "volume": existing.get("volume") or volume,
+                        "ltt": existing.get("ltt") or now_dt,
+                        "updated_at": now_dt,
+                    }
+                    seeded += 1
+
+            logger.info("Prior close bootstrap completed: %d/%d symbols seeded", seeded, len(sec_ids))
+            return seeded
+        except Exception:
+            logger.exception("Error during prior close bootstrap")
+            return 0
+
+
     def _data_consumer(self):
+        schema_logged_types = set()
         while not self.stop_event.is_set():
             try:
                 response = self.data_queue.get(timeout=1)
-                if response and response.get("type") in ["Ticker Data", "Full Data"]:
-                    sec_id = str(response["security_id"])
-                    ltp = float(response["LTP"])
-                    ltt = datetime.strptime(
-                        f"{datetime.now(self.timeZone).date()} {response['LTT']}", "%Y-%m-%d %H:%M:%S"
-                    ).replace(tzinfo=self.timeZone)
-                    self.liveFeed[sec_id] = {"ltp": ltp, "ltt": ltt}
+                if not response or not isinstance(response, dict):
+                    continue
+
+                packet_type = response.get("type", "Unknown")
+                if packet_type not in schema_logged_types:
+                    schema_logged_types.add(packet_type)
+                    public_keys = sorted(
+                        [k for k in response.keys() if "token" not in k.lower() and "auth" not in k.lower()]
+                    )
+                    logger.info("MarketFeed packet schema received: type='%s' fields=%s", packet_type, public_keys)
+
+                sec_id = str(response.get("security_id")) if response.get("security_id") is not None else None
+                if not sec_id or sec_id == "None":
+                    continue
+
+                existing = self.liveFeed.get(sec_id, {})
+                ltp = existing.get("ltp")
+                prev_close = existing.get("prev_close")
+                net_change = existing.get("net_change")
+                volume = existing.get("volume", 0.0)
+                ltt = existing.get("ltt")
+
+                if "LTP" in response and response["LTP"] is not None:
+                    try:
+                        ltp = float(response["LTP"])
+                    except (ValueError, TypeError):
+                        pass
+
+                if "prev_close" in response and response["prev_close"] is not None:
+                    try:
+                        prev_close = float(response["prev_close"])
+                    except (ValueError, TypeError):
+                        pass
+                elif "close" in response and response["close"] is not None and packet_type in ("Quote Data", "Full Data"):
+                    try:
+                        val = float(response["close"])
+                        if val > 0:
+                            prev_close = val
+                    except (ValueError, TypeError):
+                        pass
+
+                if "volume" in response and response["volume"] is not None:
+                    try:
+                        volume = float(response["volume"])
+                    except (ValueError, TypeError):
+                        pass
+
+                if "LTT" in response and response["LTT"]:
+                    try:
+                        ltt = datetime.strptime(
+                            f"{datetime.now(self.timeZone).date()} {response['LTT']}", "%Y-%m-%d %H:%M:%S"
+                        ).replace(tzinfo=self.timeZone)
+                    except Exception:
+                        ltt = datetime.now(self.timeZone)
+                elif not ltt:
+                    ltt = datetime.now(self.timeZone)
+
+                if ltp is not None and prev_close is not None and prev_close > 0:
+                    net_change = ltp - prev_close
+
+                self.liveFeed[sec_id] = {
+                    "ltp": ltp,
+                    "prev_close": prev_close,
+                    "net_change": net_change,
+                    "volume": volume,
+                    "ltt": ltt,
+                    "updated_at": datetime.now(self.timeZone),
+                }
             except Empty:
                 pass
             except Exception as e:

@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+import pandas as pd
 
 import config
 import discovery
@@ -64,45 +66,33 @@ def test_quote_change_normalization_produces_positive_move():
     assert config.MIN_PCT_MOVE <= pct_change <= config.MAX_PCT_MOVE
 
 
-def test_fetch_batch_quotes_reports_coverage(monkeypatch):
-    monkeypatch.setattr(discovery.config, "DISCOVERY_QUOTE_CHUNK", 2)
-    monkeypatch.setattr(discovery.time, "sleep", lambda _: None)
+def test_websocket_discovery_reports_coverage_and_retains_movers(monkeypatch):
+    b = MagicMock()
+    b.liveFeed = {
+        "11": {"ltp": 100.0, "prev_close": 98.0, "net_change": 2.0, "volume": 1000, "updated_at": datetime.now(config.TIME_ZONE)},
+    }
+    universe_df = pd.DataFrame([{"SECURITY_ID": sid, "DISPLAY_NAME": f"SYM_{sid}"} for sid in [11, 12, 13, 14]])
 
-    class Broker:
-        def get_quote_batch(self, exchange, security_ids):
-            if security_ids[0] == 13:
-                return {}
-            return {str(security_ids[0]): {"last_price": 100.0, "net_change": 1.0}}
-
-    quotes, requested, failed = discovery._fetch_batch_quotes(Broker(), [11, 12, 13, 14])
-
-    assert requested == 4
-    assert len(quotes) == 1
-    assert failed == [{"offset": 2, "count": 2, "sample": ["13", "14"]}]
+    with patch("discovery.state.snapshot", return_value={"top_gainers": [{"SECURITY_ID": 11}]}), \
+         patch("discovery.state.update") as mock_update:
+        # Coverage is 1/4 = 25% < 90%, so update should not be called and movers retained
+        discovery.refresh_from_livefeed_full_universe(b, universe_df)
+        mock_update.assert_not_called()
 
 
-def test_fetch_batch_quotes_stops_after_cooldown(monkeypatch):
-    monkeypatch.setattr(discovery.config, "DISCOVERY_QUOTE_CHUNK", 2)
-    monkeypatch.setattr(discovery.time, "sleep", lambda _: None)
-    calls = []
+def test_discovery_loop_no_rest_quote_calls(monkeypatch):
+    """Verify live discovery loop calls refresh_from_livefeed_full_universe without invoking get_quote_batch."""
+    b = MagicMock()
+    b.liveFeed = {}
+    b.get_quote_batch = MagicMock()
+    universe_df = pd.DataFrame([{"SECURITY_ID": 1000, "DISPLAY_NAME": "SYM"}])
 
-    class Broker:
-        cooldown = False
+    with patch("discovery.state.snapshot", return_value={"final_universe_locked": False}), \
+         patch("discovery.state.update"):
+        # Run 1 iteration of discovery
+        discovery.refresh_from_livefeed_full_universe(b, universe_df)
+        b.get_quote_batch.assert_not_called()
 
-        def is_quote_cooldown_active(self):
-            return self.cooldown
-
-        def get_quote_batch(self, exchange, security_ids):
-            calls.append(list(security_ids))
-            self.cooldown = True
-            return {}
-
-    quotes, requested, failed = discovery._fetch_batch_quotes(Broker(), [1, 2, 3, 4, 5, 6])
-
-    assert calls == [[1, 2]]
-    assert requested == 6
-    assert len(quotes) == 0
-    assert failed == [{"offset": 0, "count": 2, "sample": ["1", "2"]}]
 
 
 def test_top_movers_throttle_uses_time_interval(monkeypatch):
