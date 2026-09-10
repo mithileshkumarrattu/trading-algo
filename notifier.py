@@ -113,15 +113,22 @@ def notify_setup_expired(symbol, direction):
 
 def notify_entry(symbol, direction, qty, entry_price, sl_price, target_price, paper_mode,
                  alpha_open_time=None, alpha_high=None, alpha_low=None, trigger_1m_time=None,
-                 strategy="ALPHA"):
+                 strategy="ALPHA", pattern_confirmation_time=None, entry_extension_pct=None,
+                 regime_mode=None):
     arrow = "🟢" if direction == "BUY" else "🔴"
     alpha_level_name = "Alpha High" if direction == "BUY" else "Alpha Low"
     alpha_level = alpha_high if direction == "BUY" else alpha_low
     details = []
+    if regime_mode:
+        details.append(f"Regime mode: {regime_mode}")
     if alpha_open_time:
         details.append(f"Pattern candle: {alpha_open_time}")
+    if pattern_confirmation_time:
+        details.append(f"Confirmation: {pattern_confirmation_time}")
     if alpha_level is not None:
         details.append(f"{alpha_level_name}: ₹{float(alpha_level):.2f}")
+    if entry_extension_pct is not None:
+        details.append(f"Entry extension: {entry_extension_pct:+.2f}%")
     if trigger_1m_time:
         details.append(f"Breakout 1-min candle: {trigger_1m_time}")
     audit_text = "\n" + "\n".join(details) if details else ""

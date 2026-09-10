@@ -34,6 +34,7 @@ from broker import DhanBroker
 _stop_event = threading.Event()
 _candle_cache = {}
 _pattern_candle_cache = {}
+_jp_pattern_candle_cache = {}
 _processed_alpha_1m_candles = set()
 
 
@@ -79,6 +80,28 @@ def get_cached_pattern_candles(broker, security_id, prev_trade_date, timeframe):
     )
     if candles is not None and not candles.empty:
         _pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
+    return candles
+
+
+def get_cached_jp_pattern_candles_with_warmup(broker, security_id, prev_trade_date):
+    if not getattr(config, "JP_USE_PREVIOUS_SESSION_WARMUP", True):
+        return get_cached_pattern_candles(broker, security_id, prev_trade_date, config.JP_TIMEFRAME)
+
+    key = f"JP_WARMUP_{security_id}"
+    now = time.time()
+    cached = _jp_pattern_candle_cache.get(key)
+    if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
+        return cached["data"]
+
+    candles = broker.get_pattern_candles_with_warmup(
+        security_id=security_id,
+        exchange_segment=config.EXCHANGE,
+        instrument_type="EQUITY",
+        prev_trade_date=prev_trade_date,
+        pattern_timeframe=config.JP_TIMEFRAME,
+    )
+    if candles is not None and not candles.empty:
+        _jp_pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
     return candles
 
 
@@ -247,12 +270,39 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         return "SKIPPED_NO_LTP"
 
     fill = max(float(ltp), close) if direction == "BUY" else min(float(ltp), close)
+
+    # Check entry extension percentage (prevent chasing price when it has moved too far past trigger)
+    ext_pct = pattern.entry_extension_pct(fill, trigger_level, side=direction)
+    max_ext_pct = getattr(config, "ALPHA_MAX_ENTRY_EXTENSION_PCT", 0.35)
+    if ext_pct > max_ext_pct:
+        state.log_setup_outcome(setup, "ENTRY_REJECTED_EXTENSION", f"ext={ext_pct:.2f}% > max={max_ext_pct:.2f}%")
+        state.add_log(f"{symbol}: Entry rejected - extension {ext_pct:.2f}% exceeds {max_ext_pct:.2f}%")
+        if strategy == "JP":
+            state.remove_jp_setup(security_id)
+        else:
+            state.remove_alpha_setup(security_id)
+        return "ENTRY_REJECTED_EXTENSION"
+
+    # For countertrend setups, verify confirmation volume meets minimum threshold
+    regime_mode = setup.get("regime_mode")
+    signal_quality = setup.get("signal_quality", {})
+    conf_vol = signal_quality.get("confirmation_volume_ratio", 1.0)
+    if regime_mode == "COUNTERTREND":
+        min_counter_vol = getattr(config, "REGIME_COUNTERTREND_MIN_CONFIRMATION_VOLUME_RATIO", 1.50)
+        if conf_vol < min_counter_vol:
+            state.log_setup_outcome(setup, "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW", f"conf_vol={conf_vol:.2f} < min={min_counter_vol:.2f}")
+            state.add_log(f"{symbol}: Entry rejected - countertrend confirmation volume {conf_vol:.2f}x below {min_counter_vol:.2f}x")
+            if strategy == "JP":
+                state.remove_jp_setup(security_id)
+            else:
+                state.remove_alpha_setup(security_id)
+            return "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW"
+
     alpha_high = float(setup.get("alpha_high") if setup.get("alpha_high") is not None else setup.get("jp_high") or trigger_level)
     alpha_low = float(setup.get("alpha_low") if setup.get("alpha_low") is not None else setup.get("jp_low") or trigger_level)
     alpha_open_time = setup.get("alpha_open_time") or setup.get("jp_open_time")
     alpha_close_time = setup.get("alpha_close_time") or setup.get("jp_close_time")
     alpha_key = setup.get("alpha_key") or setup.get("jp_key")
-    signal_quality = setup.get("signal_quality", {})
     pattern_confirmation_time = setup.get("pattern_confirmation_time")
 
     position = engine.enter_trade(
@@ -275,6 +325,8 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         alpha_key=alpha_key,
         signal_quality=signal_quality,
         pattern_confirmation_time=pattern_confirmation_time,
+        regime_mode=regime_mode,
+        regime_reason=setup.get("regime_reason"),
     )
 
     if position is not None:
@@ -317,6 +369,43 @@ def get_prev_trading_day(broker):
     return datetime.now(config.TIME_ZONE).date() - timedelta(days=1)
 
 
+def market_regime_allows_setup(
+    direction: str,
+    market_regime: str,
+    pct_change: float,
+    confirmation_volume_ratio: float | None = None,
+):
+    """
+    Return (allowed: bool, mode: str, reason: str).
+    Direction is BUY or SELL.
+    Market regime is BULLISH, BEARISH, NEUTRAL, or UNKNOWN.
+    """
+    market_regime = (market_regime or "UNKNOWN").upper()
+    direction = direction.upper()
+    abs_move = abs(float(pct_change or 0.0))
+
+    aligned = (
+        (direction == "BUY" and market_regime == "BULLISH")
+        or (direction == "SELL" and market_regime == "BEARISH")
+    )
+
+    if aligned:
+        if abs_move >= config.REGIME_ALIGNED_MIN_STOCK_MOVE_PCT:
+            return True, "ALIGNED", "REGIME_ALIGNED"
+        return False, "ALIGNED", "MOVE_TOO_SMALL"
+
+    if market_regime in ("UNKNOWN", "NEUTRAL"):
+        if abs_move >= config.REGIME_NEUTRAL_MIN_STOCK_MOVE_PCT:
+            return True, "NEUTRAL", "REGIME_NEUTRAL_STRENGTH_OK"
+        return False, "NEUTRAL", "NEUTRAL_REGIME_MOVE_TOO_SMALL"
+
+    # Countertrend: allowed only with substantial relative strength/weakness.
+    if abs_move < config.REGIME_COUNTERTREND_MIN_STOCK_MOVE_PCT:
+        return False, "COUNTERTREND", "COUNTERTREND_MOVE_TOO_SMALL"
+
+    return True, "COUNTERTREND", "COUNTERTREND_PENDING_STRONG_CONFIRMATION"
+
+
 def update_market_regime(broker):
     try:
         net_change = broker.get_net_change("IDX_I", config.INDEX_SECURITY_ID)
@@ -355,12 +444,13 @@ def build_scan_candidates():
     now = datetime.now(config.TIME_ZONE).time()
     morning = datetime.strptime("09:20", "%H:%M").time() <= now <= datetime.strptime("10:30", "%H:%M").time()
     limit = config.MORNING_MAX_CANDIDATES_PER_SIDE if morning else config.REGULAR_MAX_CANDIDATES_PER_SIDE
-    gainers = [{**item, "is_bullish_setup": True} for item in snap.get("top_gainers", [])[:limit]]
-    candidates = gainers if config.ALPHA_ENABLED else []
+    gainers = [{**item, "is_bullish_setup": True} for item in snap.get("top_gainers", [])[:limit]] if config.ALPHA_ALLOW_BUY else []
+    losers = [{**item, "is_bullish_setup": False} for item in snap.get("top_losers", [])[:limit]] if config.ALPHA_ALLOW_SELL else []
+    candidates = (gainers + losers) if config.ALPHA_ENABLED else []
     now_ts = time.time()
     if now_ts - _last_scan_status_log_at >= 60:
         state.add_log(
-            f"Scan universe: LIVE, gainers={len(gainers)}, losers=0, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
+            f"Scan universe: LIVE, gainers={len(gainers)}, losers={len(losers)}, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
         )
         _last_scan_status_log_at = now_ts
     return candidates
@@ -383,8 +473,21 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
     security_id = int(candidate["SECURITY_ID"])
     symbol = candidate["display_name"]
     is_bullish_setup = candidate["is_bullish_setup"]
+    direction = "BUY" if is_bullish_setup else "SELL"
     regime = state.snapshot().get("market_regime")
-    if config.JP_REQUIRE_MARKET_REGIME and ((is_bullish_setup and regime != "BULLISH") or (not is_bullish_setup and regime != "BEARISH")):
+    pct_change = candidate.get("pct_change", 0.0)
+
+    regime_mode = "ALIGNED"
+    regime_reason = "REGIME_ALIGNED"
+    if getattr(config, "JP_USE_MARKET_REGIME_FILTER", True):
+        allowed, regime_mode, regime_reason = market_regime_allows_setup(
+            direction=direction,
+            market_regime=regime,
+            pct_change=pct_change,
+        )
+        if not allowed:
+            return
+    elif config.JP_REQUIRE_MARKET_REGIME and ((is_bullish_setup and regime != "BULLISH") or (not is_bullish_setup and regime != "BEARISH")):
         return
 
     if state.jp_signal_count(security_id) >= config.JP_MAX_SIGNALS_PER_SYMBOL_PER_DAY:
@@ -394,7 +497,7 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
         return
 
     try:
-        candles_3m = get_cached_pattern_candles(broker, security_id, prev_trade_date, config.JP_TIMEFRAME)
+        candles_3m = get_cached_jp_pattern_candles_with_warmup(broker, security_id, prev_trade_date)
     except Exception:
         logger.exception(f"JP pattern candle fetch failed for {symbol}")
         return
@@ -402,10 +505,16 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
         return
 
     today = datetime.now(config.TIME_ZONE).date()
-    candles_3m = candles_3m[candles_3m["timestamp"].dt.date == today].copy()
-    result = jp_pattern.find_jp_setup(candles_3m, is_bullish_setup)
+    result = jp_pattern.find_jp_setup(candles_3m, is_bullish_setup, session_date=today)
     if result is None:
         return
+
+    # If countertrend, verify stricter confirmation volume threshold
+    conf_vol_ratio = result.get("confirmation_volume_ratio", 1.0)
+    if regime_mode == "COUNTERTREND":
+        min_counter_vol = getattr(config, "REGIME_COUNTERTREND_MIN_CONFIRMATION_VOLUME_RATIO", 1.50)
+        if conf_vol_ratio < min_counter_vol:
+            return
 
     now = datetime.now(config.TIME_ZONE)
     age_minutes = (now - result["jp_close_time"]).total_seconds() / 60.0
@@ -441,12 +550,21 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
         "stop_distance_pct": round(stop_pct, 3), "detected_at": now.isoformat(),
         "expires_at": (result["jp_close_time"] + timedelta(minutes=config.JP_MAX_ENTRY_MINUTES)).isoformat(),
         "jp_key": key,
+        "regime_mode": regime_mode,
+        "regime_reason": regime_reason,
+        "signal_quality": {
+            "compression_valid": result.get("compression_valid", False),
+            "prior_band_touch_count": result.get("prior_band_touch_count", 0),
+            "confirmation_volume_ratio": result.get("confirmation_volume_ratio", 1.0),
+            "pullback_volume_ratio": result.get("volume_ratio", 1.0),
+            "body_ratio": round(result.get("body_ratio", 0.0), 3),
+        },
     }
     state.set_jp_watchlist_item(security_id, item)
     state.mark_jp_alerted(key)
     state.add_log(
         f"{symbol}: JP {result['direction']} detected at {result['jp_open_time'].isoformat()} "
-        f"trigger={result['trigger_price']:.2f} SL={result['stop_price']:.2f}"
+        f"trigger={result['trigger_price']:.2f} SL={result['stop_price']:.2f} [{regime_mode}]"
     )
     state.increment_jp_signal_count(security_id)
     if config.SEND_TELEGRAM_ON_JP_SETUP:
@@ -462,11 +580,23 @@ def scan_candidate(broker, candidate, prev_trade_date):
     security_id = int(candidate["SECURITY_ID"])
     symbol = candidate["display_name"]
     is_bullish_setup = candidate["is_bullish_setup"]
-    if not is_bullish_setup or not config.ALPHA_ALLOW_SELL:
-        if not is_bullish_setup:
+    direction = "BUY" if is_bullish_setup else "SELL"
+    regime = state.snapshot().get("market_regime")
+    pct_change = candidate.get("pct_change", 0.0)
+
+    regime_mode = "ALIGNED"
+    regime_reason = "REGIME_ALIGNED"
+    if getattr(config, "ALPHA_USE_MARKET_REGIME_FILTER", True):
+        allowed, regime_mode, regime_reason = market_regime_allows_setup(
+            direction=direction,
+            market_regime=regime,
+            pct_change=pct_change,
+        )
+        if not allowed:
             return
-    if config.ALPHA_REQUIRE_MARKET_BULLISH and state.snapshot().get("market_regime") == "BEARISH":
-        return
+    elif config.ALPHA_REQUIRE_MARKET_REGIME:
+        if (is_bullish_setup and regime == "BEARISH") or (not is_bullish_setup and regime == "BULLISH"):
+            return
 
     if str(security_id) in state.snapshot()["open_positions"]:
         return
@@ -489,77 +619,121 @@ def scan_candidate(broker, candidate, prev_trade_date):
         logger.exception(f"Pattern-timeframe candle fetch failed for {symbol}")
         return
 
-    if watchlist_entry is None or watchlist_entry.get("stage") != "AWAITING_BREAKOUT":
-        result = pattern.find_trend_run_and_alpha(today_pattern, is_bullish_setup)
-        if result is None:
-            state.remove_watchlist_item(security_id)
-            return
-
-        alpha = result["alpha_candle"]
-        alpha_range_pct = ((float(alpha.high) - float(alpha.low)) / float(alpha.close)) * 100
-        if alpha_range_pct > config.MAX_ALPHA_RANGE_PCT:
-            state.add_log(
-                f"{symbol}: Alpha rejected - range {alpha_range_pct:.2f}% "
-                f"exceeds {config.MAX_ALPHA_RANGE_PCT:.2f}%"
-            )
-            return
-        direction = "BUY" if is_bullish_setup else "SELL"
-        alpha_open_time = alpha.timestamp.to_pydatetime()
-        alpha_close_time = alpha_open_time + timedelta(minutes=config.ALPHA_TIMEFRAME)
-        trend_volumes = [float(c.volume) for c in result["trend_run"] if float(c.volume) > 0]
-        trend_volume_ratio = float(alpha.volume) / (sum(trend_volumes) / len(trend_volumes)) if trend_volumes else 1.0
-        now = datetime.now(config.TIME_ZONE)
-        alpha_age_minutes = (now - alpha_close_time).total_seconds() / 60.0
-        alpha_key = f"{security_id}_{direction}_{alpha_open_time.isoformat()}"
-
-        if alpha_close_time > now:
-            state.add_log(f"{symbol}: Alpha ignored - pattern candle has not closed yet ({alpha_open_time.isoformat()})")
-            return
-        if alpha_age_minutes > config.ALPHA_MAX_ENTRY_MINUTES:
-            state.add_log(f"{symbol}: stale Alpha ignored - {alpha_age_minutes:.1f} min old, candle={alpha_open_time.isoformat()}")
-            return
-        if state.is_expired_alpha(alpha_key):
-            state.add_log(f"{symbol}: expired Alpha ignored - key={alpha_key}")
-            return
-
-        dedup_key = alpha_key
-        state.set_watchlist_item(security_id, {
-            "symbol": symbol,
-            "security_id": str(security_id),
-            "is_bullish_setup": is_bullish_setup,
-            "direction": direction,
-            "stage": "AWAITING_BREAKOUT",
-            "alpha_high": float(alpha.high),
-            "alpha_low": float(alpha.low),
-            "alpha_volume": float(alpha.volume),
-            "alpha_open_time": alpha_open_time.isoformat(),
-            "alpha_close_time": alpha_close_time.isoformat(),
-            "alpha_detected_at": now.isoformat(),
-            "alpha_candle_time": str(alpha.timestamp),
-            "trend_candle_count": len(result["trend_run"]),
-            "current_ltp": None,
-            "distance_to_trigger_pct": None,
-            "hold_expires_at": (alpha_close_time + timedelta(
-                minutes=config.ALPHA_MAX_ENTRY_MINUTES
-            )).isoformat(),
-            "expires_at": (alpha_close_time + timedelta(minutes=config.ALPHA_MAX_ENTRY_MINUTES)).isoformat(),
-            "pattern_confirmation_time": result.get("pattern_confirmation_time").isoformat(),
-            "pattern_confirmation_status": "CONFIRMED",
-            "signal_quality": {
-                "trend_volume_ratio": round(trend_volume_ratio, 3),
-                "pullback_volume_ratio": round(trend_volume_ratio, 3),
-                "body_ratio": round(pattern.candle_body_ratio(alpha), 3),
-                "body_to_wick_ratio": round(pattern.body_to_wick_ratio(alpha), 3),
-            },
-            "alpha_key": alpha_key,
-        })
-        if not state.has_alerted(dedup_key):
-            if config.SEND_TELEGRAM_ON_SETUP_WATCH:
-                notifier.notify_alpha_candle_detected(symbol, direction, str(alpha.timestamp),
-                                                       float(alpha.high), float(alpha.low), config.PATTERN_TIMEFRAME)
-            state.mark_alerted(dedup_key)
-            state.add_log(f"{symbol}: Alpha Candle detected ({direction}) at {alpha.timestamp}")
+    # If setup is already confirmed and awaiting 1m breakout, let process_new_1m_bar_for_setup handle it
+    if watchlist_entry is not None and watchlist_entry.get("stage") == "AWAITING_BREAKOUT":
         return
+
+    # If setup is waiting for 3m confirmation, evaluate newly completed 3m bars against the stored Alpha candle
+    if watchlist_entry is not None and watchlist_entry.get("stage") == "WAITING_3M_CONFIRMATION":
+        eval_res = pattern.evaluate_alpha_confirmation(today_pattern, watchlist_entry)
+        if eval_res.get("status") == "CONFIRMED":
+            watchlist_entry["stage"] = "AWAITING_BREAKOUT"
+            watchlist_entry["pattern_confirmation_status"] = "CONFIRMED"
+            watchlist_entry["pattern_confirmation_time"] = eval_res.get("pattern_confirmation_time")
+            conf_vol = eval_res.get("confirmation_volume_ratio", 1.0)
+            watchlist_entry.setdefault("signal_quality", {})["confirmation_volume_ratio"] = conf_vol
+            state.set_watchlist_item(security_id, watchlist_entry)
+            dedup_key = watchlist_entry.get("alpha_key", str(security_id))
+            if not state.has_alerted(dedup_key):
+                if config.SEND_TELEGRAM_ON_SETUP_WATCH:
+                    notifier.notify_alpha_candle_detected(
+                        symbol, direction, watchlist_entry.get("alpha_candle_time", ""),
+                        float(watchlist_entry.get("alpha_high", 0.0)), float(watchlist_entry.get("alpha_low", 0.0)),
+                        config.PATTERN_TIMEFRAME
+                    )
+                state.mark_alerted(dedup_key)
+                state.add_log(f"{symbol}: Alpha Candle confirmed & ready ({direction}) [{regime_mode}]")
+            return
+        elif eval_res.get("status") == "EXPIRED":
+            state.remove_watchlist_item(security_id)
+            state.log_setup_outcome(watchlist_entry, "EXPIRED_NO_3M_CONFIRMATION", "")
+            return
+        # Still waiting for confirmation within deadline; do not overwrite with fresh run yet
+        return
+
+    result = pattern.find_trend_run_and_alpha(today_pattern, is_bullish_setup)
+    if result is None:
+        return
+
+    alpha = result["alpha_candle"]
+    alpha_range_pct = ((float(alpha.high) - float(alpha.low)) / float(alpha.close)) * 100
+    if alpha_range_pct > config.MAX_ALPHA_RANGE_PCT:
+        state.add_log(
+            f"{symbol}: Alpha rejected - range {alpha_range_pct:.2f}% "
+            f"exceeds {config.MAX_ALPHA_RANGE_PCT:.2f}%"
+        )
+        return
+    direction = result.get("direction") or ("BUY" if is_bullish_setup else "SELL")
+    alpha_open_time = result["alpha_open_time"]
+    alpha_close_time = result["alpha_close_time"]
+    trend_volumes = [float(c.volume) for c in result["trend_run"] if float(c.volume) > 0]
+    trend_volume_ratio = float(alpha.volume) / (sum(trend_volumes) / len(trend_volumes)) if trend_volumes else 1.0
+    now = datetime.now(config.TIME_ZONE)
+    alpha_age_minutes = (now - alpha_close_time).total_seconds() / 60.0
+    alpha_key = f"{security_id}_{direction}_{alpha_open_time.isoformat()}"
+
+    if alpha_close_time > now:
+        state.add_log(f"{symbol}: Alpha ignored - pattern candle has not closed yet ({alpha_open_time.isoformat()})")
+        return
+    if alpha_age_minutes > config.ALPHA_MAX_ENTRY_MINUTES:
+        state.add_log(f"{symbol}: stale Alpha ignored - {alpha_age_minutes:.1f} min old, candle={alpha_open_time.isoformat()}")
+        return
+    if state.is_expired_alpha(alpha_key):
+        state.add_log(f"{symbol}: expired Alpha ignored - key={alpha_key}")
+        return
+
+    stage = "AWAITING_BREAKOUT" if result.get("pattern_confirmation_status") == "CONFIRMED" else "WAITING_3M_CONFIRMATION"
+    dedup_key = alpha_key
+    conf_time = result.get("pattern_confirmation_time")
+    conf_time_str = conf_time.isoformat() if conf_time is not None and hasattr(conf_time, "isoformat") else str(conf_time) if conf_time else None
+
+    state.set_watchlist_item(security_id, {
+        "strategy": "ALPHA",
+        "symbol": symbol,
+        "security_id": str(security_id),
+        "is_bullish_setup": is_bullish_setup,
+        "direction": direction,
+        "stage": stage,
+        "alpha_high": float(alpha.high),
+        "alpha_low": float(alpha.low),
+        "trigger_price": float(alpha.high if is_bullish_setup else alpha.low),
+        "pattern_high": float(alpha.high),
+        "pattern_low": float(alpha.low),
+        "alpha_volume": float(alpha.volume),
+        "alpha_open_time": alpha_open_time.isoformat(),
+        "alpha_close_time": alpha_close_time.isoformat(),
+        "pattern_open_time": alpha_open_time.isoformat(),
+        "pattern_close_time": alpha_close_time.isoformat(),
+        "alpha_detected_at": now.isoformat(),
+        "alpha_candle_time": str(alpha.timestamp),
+        "trend_candle_count": len(result["trend_run"]),
+        "current_ltp": None,
+        "distance_to_trigger_pct": None,
+        "hold_expires_at": (alpha_close_time + timedelta(
+            minutes=config.ALPHA_MAX_ENTRY_MINUTES
+        )).isoformat(),
+        "expires_at": (alpha_close_time + timedelta(minutes=config.ALPHA_MAX_ENTRY_MINUTES)).isoformat(),
+        "pattern_confirmation_time": conf_time_str,
+        "pattern_confirmation_status": result.get("pattern_confirmation_status"),
+        "signal_quality": {
+            "trend_volume_ratio": round(trend_volume_ratio, 3),
+            "pullback_volume_ratio": round(result.get("pullback_volume_ratio", trend_volume_ratio), 3),
+            "confirmation_volume_ratio": round(result.get("confirmation_volume_ratio", 1.0), 3),
+            "close_position_in_range": round(result.get("close_position_in_range", pattern.close_position(alpha)), 3),
+            "body_ratio": round(pattern.candle_body_ratio(alpha), 3),
+            "body_to_wick_ratio": round(pattern.body_to_wick_ratio(alpha), 3),
+        },
+        "alpha_key": alpha_key,
+        "regime_mode": regime_mode,
+        "regime_reason": regime_reason,
+    })
+    if stage == "AWAITING_BREAKOUT" and not state.has_alerted(dedup_key):
+        if config.SEND_TELEGRAM_ON_SETUP_WATCH:
+            notifier.notify_alpha_candle_detected(symbol, direction, str(alpha.timestamp),
+                                                   float(alpha.high), float(alpha.low), config.PATTERN_TIMEFRAME)
+        state.mark_alerted(dedup_key)
+        state.add_log(f"{symbol}: Alpha Candle confirmed & ready ({direction}) at {alpha.timestamp} [{regime_mode}]")
+    return
 
     if "alpha_close_time" not in watchlist_entry or "alpha_key" not in watchlist_entry:
         state.remove_watchlist_item(security_id)
@@ -662,17 +836,15 @@ def evaluate_diagnostics_for_top_candidates(broker, prev_trade_date):
             sid = int(cand["SECURITY_ID"])
             sym = cand.get("display_name", str(sid))
             cand_info = {**cand, "is_bullish_setup": True}
-            candles = get_cached_pattern_candles(broker, sid, prev_trade_date, config.JP_TIMEFRAME)
-            today_candles = None
-            if candles is not None and not candles.empty:
-                today_candles = candles[candles["timestamp"].dt.date == now.date()].copy()
+            candles = get_cached_jp_pattern_candles_with_warmup(broker, sid, prev_trade_date)
             diag = signal_diagnostics.diagnose_jp_candidate(
                 symbol=sym,
                 security_id=sid,
                 candidate_info=cand_info,
-                today_pattern_candles=today_candles,
+                today_pattern_candles=candles,
                 regime=regime,
                 now=now,
+                session_date=now.date(),
             )
             signal_diagnostics.record_diagnostic(diag)
         except Exception:
@@ -685,17 +857,15 @@ def evaluate_diagnostics_for_top_candidates(broker, prev_trade_date):
             sid = int(cand["SECURITY_ID"])
             sym = cand.get("display_name", str(sid))
             cand_info = {**cand, "is_bullish_setup": False}
-            candles = get_cached_pattern_candles(broker, sid, prev_trade_date, config.JP_TIMEFRAME)
-            today_candles = None
-            if candles is not None and not candles.empty:
-                today_candles = candles[candles["timestamp"].dt.date == now.date()].copy()
+            candles = get_cached_jp_pattern_candles_with_warmup(broker, sid, prev_trade_date)
             diag = signal_diagnostics.diagnose_jp_candidate(
                 symbol=sym,
                 security_id=sid,
                 candidate_info=cand_info,
-                today_pattern_candles=today_candles,
+                today_pattern_candles=candles,
                 regime=regime,
                 now=now,
+                session_date=now.date(),
             )
             signal_diagnostics.record_diagnostic(diag)
         except Exception:

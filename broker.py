@@ -652,6 +652,61 @@ class DhanBroker(metaclass=SingletonMeta):
             timeframe=int(pattern_timeframe), skip_incomplete=True,
         )
 
+    def get_pattern_candles_with_warmup(
+        self,
+        security_id,
+        exchange_segment,
+        instrument_type,
+        prev_trade_date,
+        pattern_timeframe=3,
+    ):
+        """
+        Fetches source 1-min candles for previous trading day and today separately,
+        resamples each session independently to avoid overnight distortion,
+        and prepends the last JP_WARMUP_PATTERN_BARS to today's series for SMMA warmup.
+        """
+        today_date = datetime.now(self.timeZone).date()
+        warmup_bars = getattr(config, "JP_WARMUP_PATTERN_BARS", 20)
+
+        # 1. Fetch and resample previous trading day 1m data
+        prev_1m = self.get_intraday_candles(
+            security_id=security_id,
+            exchange_segment=exchange_segment,
+            instrument_type=instrument_type,
+            from_dt=prev_trade_date,
+            to_dt=prev_trade_date,
+            timeframe=config.SOURCE_CANDLE_TIMEFRAME,
+            skip_incomplete=False,
+        )
+        prev_3m = pd.DataFrame()
+        if prev_1m is not None and not prev_1m.empty:
+            prev_3m = self._resample_session_aligned_3m(prev_1m)
+            if not prev_3m.empty and warmup_bars > 0:
+                prev_3m = prev_3m.tail(warmup_bars)
+
+        # 2. Fetch and resample today's 1m data
+        today_1m = self.get_intraday_candles(
+            security_id=security_id,
+            exchange_segment=exchange_segment,
+            instrument_type=instrument_type,
+            from_dt=today_date,
+            to_dt=today_date,
+            timeframe=config.SOURCE_CANDLE_TIMEFRAME,
+            skip_incomplete=False,
+        )
+        today_3m = pd.DataFrame()
+        if today_1m is not None and not today_1m.empty:
+            today_3m = self._resample_session_aligned_3m(self._completed_1m_only(today_1m))
+
+        if prev_3m.empty and today_3m.empty:
+            return pd.DataFrame()
+        if prev_3m.empty:
+            return today_3m
+        if today_3m.empty:
+            return prev_3m
+
+        return pd.concat([prev_3m, today_3m], ignore_index=True).sort_values("timestamp").reset_index(drop=True)
+
     def get_historical_daily_candles(self, security_id, exchange_segment, instrument_type, from_dt, to_dt, tz="Asia/Kolkata"):
         from_str = from_dt.strftime("%Y-%m-%d")
         to_str = to_dt.strftime("%Y-%m-%d")

@@ -69,7 +69,8 @@ def can_take_new_trade():
 
 def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha_low, entry_candle,
                 tick_size=0.05, alpha_open_time=None, alpha_close_time=None, alpha_key=None,
-                strategy="ALPHA", signal_quality=None, pattern_confirmation_time=None):
+                strategy="ALPHA", signal_quality=None, pattern_confirmation_time=None,
+                regime_mode=None, regime_reason=None):
     ok, reason = can_take_new_trade()
     if not ok:
         state.add_log(f"{symbol}: entry blocked - {reason}")
@@ -123,10 +124,14 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
                                           order_type="STOP_LOSS", product_type=config.PRODUCT_TYPE,
                                           limit_price=sl_price, trigger_price=sl_price, tick_size=tick_size)
 
+    trigger_level = float(alpha_high if is_bullish_setup else alpha_low)
+    ext_pct = pattern.entry_extension_pct(entry_price, trigger_level, side=transaction_type)
+
     position = {
         "strategy": strategy,
         "entry_reason": "1_MIN_WICK_BREAK",
-        "trigger_price_level": float(alpha_high if is_bullish_setup else alpha_low),
+        "trigger_price_level": trigger_level,
+        "entry_extension_pct": round(ext_pct, 3),
         "security_id": str(security_id),
         "symbol": symbol,
         "transaction_type": transaction_type,
@@ -162,6 +167,8 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
         "status": "OPEN",
         "signal_quality": signal_quality or {},
         "pattern_confirmation_time": pattern_confirmation_time,
+        "regime_mode": regime_mode,
+        "regime_reason": regime_reason,
     }
     state.set_open_position(security_id, position)
     notifier.notify_entry(
@@ -171,6 +178,9 @@ def enter_trade(broker, security_id, symbol, is_bullish_setup, alpha_high, alpha
         alpha_high=alpha_high, alpha_low=alpha_low,
         trigger_1m_time=str(entry_candle.timestamp),
         strategy=strategy,
+        pattern_confirmation_time=pattern_confirmation_time,
+        entry_extension_pct=round(ext_pct, 3),
+        regime_mode=regime_mode,
     )
     return position
 

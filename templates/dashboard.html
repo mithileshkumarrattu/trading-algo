@@ -460,9 +460,22 @@
       color: var(--green-strong);
     }
 
-    .tag.runner {
-      background: rgba(47,108,239,0.09);
+    .tag.aligned {
+      color: var(--green-strong);
+      background: var(--green-soft);
+      border: 1px solid rgba(24,166,109,0.18);
+    }
+
+    .tag.neutral {
       color: var(--blue);
+      background: var(--blue-soft);
+      border: 1px solid rgba(47,108,239,0.18);
+    }
+
+    .tag.countertrend {
+      color: #9a6700;
+      background: var(--amber-soft);
+      border: 1px solid rgba(216,146,28,0.22);
     }
 
     .log-box {
@@ -770,6 +783,11 @@
             <span class="label">Daily P/L</span>
             <span class="value positive" id="dailyPnlMini">₹0.00</span>
           </div>
+          <div class="mini-stat">
+            <span class="label">Positions</span>
+            <span class="value" id="openCountMini">0</span>
+          </div>
+        </div>
         <div class="metric-row">
           <div class="mini-stat">
             <span class="label">Feed Health</span>
@@ -838,12 +856,14 @@
                 <tr>
                   <th>Symbol</th>
                   <th>Setup</th>
+                  <th>Regime</th>
                   <th>Stage</th>
                   <th>Alpha Time</th>
                   <th>Alpha High</th>
                   <th>Alpha Low</th>
                   <th>Current LTP</th>
                   <th>Dist to Trigger</th>
+                  <th>Quality / Structure</th>
                   <th>Expires In</th>
                 </tr>
               </thead>
@@ -859,7 +879,7 @@
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Symbol</th><th>Side</th><th>Stage</th><th>JP Time</th><th>Trigger</th><th>SL</th><th>SMMA Band</th></tr></thead>
+              <thead><tr><th>Symbol</th><th>Side</th><th>Regime</th><th>Stage</th><th>JP Time</th><th>Trigger</th><th>SL</th><th>SMMA Band</th><th>Quality / Structure</th></tr></thead>
               <tbody id="jpWatchlistTable"></tbody>
             </table>
           </div>
@@ -878,6 +898,7 @@
                   <th>Symbol</th>
                   <th>Strategy</th>
                   <th>Side</th>
+                  <th>Regime</th>
                   <th>Rank</th>
                   <th>Status</th>
                   <th>Reason</th>
@@ -969,7 +990,7 @@
       const tbody = document.getElementById(id);
       if (!tbody) return;
       if (!Array.isArray(rows) || rows.length === 0) {
-        const colspan = id === 'watchlistTable' ? 9 : id === 'diagnosticsTable' ? 8 : id === 'jpWatchlistTable' ? 7 : id === 'positionsTable' ? 6 : 4;
+        const colspan = id === 'watchlistTable' ? 10 : id === 'diagnosticsTable' ? 8 : id === 'jpWatchlistTable' ? 8 : id === 'positionsTable' ? 6 : 4;
         tbody.innerHTML = `<tr><td colspan="${colspan}" class="muted" style="padding: 18px; text-align: center;">No data</td></tr>`;
         return;
       }
@@ -1131,27 +1152,62 @@
         `);
 
         const watchlist = Object.values(s.watchlist || {});
-        fillRows('watchlistTable', watchlist, (r) => `
+        fillRows('watchlistTable', watchlist, (r) => {
+          const q = r.signal_quality || {};
+          const qStr = `Pullback Vol: ${q.pullback_volume_ratio ?? '—'}x | Conf Vol: ${q.confirmation_volume_ratio ?? '—'}x | Close Pos: ${q.close_position_in_range ?? '—'}`;
+          let stageLabel = (r.stage || 'WATCHING').replaceAll('_', ' ');
+          let stageCls = 'watching';
+          if (r.stage === 'AWAITING_BREAKOUT' || r.stage === 'AWAITING_1M_TRIGGER') {
+            stageLabel = 'AWAITING 1-MIN TRIGGER';
+            stageCls = 'breakout';
+          } else if (r.stage === 'WAITING_3M_CONFIRMATION') {
+            stageLabel = 'WAITING 3-MIN CONFIRMATION';
+            stageCls = 'watch';
+          } else if (r.stage === 'ENTRY_REJECTED_EXTENSION') {
+            stageLabel = 'REJECTED EXTENSION';
+            stageCls = 'sell';
+          }
+          const regMode = (r.regime_mode || 'ALIGNED').toUpperCase();
+          const regCls = regMode === 'ALIGNED' ? 'aligned' : (regMode === 'NEUTRAL' ? 'neutral' : 'countertrend');
+          return `
           <tr><td class="sym-cell">${r.symbol || '—'}</td>
             <td><span class="tag ${r.is_bullish_setup ? 'buy' : 'sell'}">${r.direction || (r.is_bullish_setup ? 'BUY' : 'SELL')}</span></td>
-            <td><span class="tag ${r.stage === 'AWAITING_BREAKOUT' ? 'breakout' : 'watching'}">${r.stage === 'AWAITING_BREAKOUT' ? 'AWAITING 1-MIN WICK BREAK' : (r.stage || 'WATCHING').replace('_', ' ')}</span></td>
+            <td><span class="tag ${regCls}">${regMode}</span></td>
+            <td><span class="tag ${stageCls}">${stageLabel}</span></td>
             <td class="num">${r.alpha_candle_time || '—'}</td>
             <td class="num">${fmt(r.alpha_high)}</td><td class="num">${fmt(r.alpha_low)}</td>
             <td class="num">${fmt(r.current_ltp)}</td>
             <td class="num">${r.distance_to_trigger_pct === null || r.distance_to_trigger_pct === undefined ? '—' : (r.distance_to_trigger_pct >= 0 ? '+' + r.distance_to_trigger_pct + '%' : r.distance_to_trigger_pct + '%')}</td>
+            <td class="num muted" style="font-size: 0.72rem; text-align: left;">${qStr}</td>
             <td class="num">${(() => { const expiresAt = r.hold_expires_at ? new Date(r.hold_expires_at).getTime() : null; const minsLeft = expiresAt ? Math.max(0, Math.round((expiresAt - Date.now()) / 60000)) : '—'; return minsLeft === '—' ? minsLeft : minsLeft + ' min'; })()}</td></tr>
-        `);
+        `});
 
         const jpWatchlist = Object.values(s.jp_watchlist || {});
-        fillRows('jpWatchlistTable', jpWatchlist, (r) => `
+        fillRows('jpWatchlistTable', jpWatchlist, (r) => {
+          const q = r.signal_quality || {};
+          const qStr = `Touches: ${q.prior_band_touch_count ?? '—'} | Comp: ${q.compression_valid ? 'YES' : 'NO'} | Conf Vol: ${q.confirmation_volume_ratio ?? '—'}x`;
+          let stageLabel = (r.stage || 'WATCHING').replaceAll('_', ' ');
+          let stageCls = 'watching';
+          if (r.stage === 'AWAITING_1M_TRIGGER') {
+            stageLabel = 'AWAITING 1-MIN TRIGGER';
+            stageCls = 'breakout';
+          } else if (r.stage === 'WAITING_3M_CONFIRMATION') {
+            stageLabel = 'WAITING 3-MIN CONFIRMATION';
+            stageCls = 'watch';
+          }
+          const regMode = (r.regime_mode || 'ALIGNED').toUpperCase();
+          const regCls = regMode === 'ALIGNED' ? 'aligned' : (regMode === 'NEUTRAL' ? 'neutral' : 'countertrend');
+          return `
           <tr><td class="sym-cell">${r.symbol || '—'}</td>
             <td><span class="tag ${r.direction === 'BUY' ? 'buy' : 'sell'}">${r.direction || '—'}</span></td>
-            <td><span class="tag watching">${(r.stage || 'WATCHING').replaceAll('_', ' ')}</span></td>
+            <td><span class="tag ${regCls}">${regMode}</span></td>
+            <td><span class="tag ${stageCls}">${stageLabel}</span></td>
             <td class="num">${r.jp_open_time || '—'}</td>
             <td class="num">${fmt(r.trigger_price)}</td>
             <td class="num negative">${fmt(r.stop_price)}</td>
-            <td class="num">${fmt(r.smma_band_low)} - ${fmt(r.smma_band_high)}</td></tr>
-        `);
+            <td class="num">${fmt(r.smma_band_low)} - ${fmt(r.smma_band_high)}</td>
+            <td class="num muted" style="font-size: 0.72rem; text-align: left;">${qStr}</td></tr>
+        `});
 
         const positions = Object.values(s.open_positions || {});
         fillRows('positionsTable', positions, (r) => `
@@ -1170,12 +1226,15 @@
           const evalTime = r.evaluated_at ? new Date(r.evaluated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '—';
           const metricsStr = Object.entries(r.metrics || {}).map(([k, v]) => `${k}=${v}`).join(', ') || '—';
           const isWaiting = r.status === 'WAITING';
+          const regMode = (r.regime_mode || 'ALIGNED').toUpperCase();
+          const regCls = regMode === 'ALIGNED' ? 'aligned' : (regMode === 'NEUTRAL' ? 'neutral' : 'countertrend');
           return `
             <tr>
               <td class="num">${evalTime}</td>
               <td class="sym-cell">${r.symbol || '—'}</td>
               <td><span class="tag ${r.strategy === 'ALPHA' ? 'watch' : 'sell'}">${r.strategy || '—'}</span></td>
               <td><span class="tag ${r.side === 'BUY' ? 'buy' : 'sell'}">${r.side || '—'}</span></td>
+              <td><span class="tag ${regCls}">${regMode}</span></td>
               <td class="num">#${r.rank ?? '—'}</td>
               <td><span class="tag ${isWaiting ? 'breakout' : 'negative'}">${r.status || '—'}</span></td>
               <td><code>${r.reason || '—'}</code></td>

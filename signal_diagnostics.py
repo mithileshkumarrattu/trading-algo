@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Alpha Rejection Reason Constants
 ALPHA_REASONS = {
     "MARKET_REGIME_BLOCKED": "MARKET_REGIME_BLOCKED",
+    "COUNTERTREND_MOVE_TOO_SMALL": "COUNTERTREND_MOVE_TOO_SMALL",
+    "NEUTRAL_REGIME_MOVE_TOO_SMALL": "NEUTRAL_REGIME_MOVE_TOO_SMALL",
+    "MOVE_TOO_SMALL": "MOVE_TOO_SMALL",
     "INSUFFICIENT_HISTORY": "INSUFFICIENT_HISTORY",
     "TREND_RUN_TOO_SHORT": "TREND_RUN_TOO_SHORT",
     "TREND_NOT_GREEN": "TREND_NOT_GREEN",
@@ -33,7 +36,13 @@ ALPHA_REASONS = {
     "ALPHA_BODY_RATIO": "ALPHA_BODY_RATIO",
     "ALPHA_BODY_TO_WICK": "ALPHA_BODY_TO_WICK",
     "ALPHA_EXCESS_REVERSAL_VOLUME": "ALPHA_EXCESS_REVERSAL_VOLUME",
+    "ALPHA_CONFIRMATION_LOW_VOLUME": "ALPHA_CONFIRMATION_LOW_VOLUME",
+    "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW": "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW",
     "NO_NEXT_TWO_3M_CONFIRMATION": "NO_NEXT_TWO_3M_CONFIRMATION",
+    "ALPHA_CANDIDATE_FORMED": "ALPHA_CANDIDATE_FORMED",
+    "WAITING_3M_CONFIRMATION": "WAITING_3M_CONFIRMATION",
+    "FIRST_CONFIRMATION_NOT_QUALIFIED": "FIRST_CONFIRMATION_NOT_QUALIFIED",
+    "ALPHA_3M_CONFIRMED": "ALPHA_3M_CONFIRMED",
     "SETUP_EXPIRED": "SETUP_EXPIRED",
     "WAITING_FOR_1M_TRIGGER": "WAITING_FOR_1M_TRIGGER",
     "CANDLE_DATA_UNAVAILABLE": "CANDLE_DATA_UNAVAILABLE",
@@ -42,6 +51,9 @@ ALPHA_REASONS = {
 # JP Rejection Reason Constants
 JP_REASONS = {
     "MARKET_REGIME_BLOCKED": "MARKET_REGIME_BLOCKED",
+    "COUNTERTREND_MOVE_TOO_SMALL": "COUNTERTREND_MOVE_TOO_SMALL",
+    "NEUTRAL_REGIME_MOVE_TOO_SMALL": "NEUTRAL_REGIME_MOVE_TOO_SMALL",
+    "MOVE_TOO_SMALL": "MOVE_TOO_SMALL",
     "OPENING_CONDITION_FAILED": "OPENING_CONDITION_FAILED",
     "SMMA_TREND_INVALID": "SMMA_TREND_INVALID",
     "PRIOR_BAND_CHOP": "PRIOR_BAND_CHOP",
@@ -52,6 +64,8 @@ JP_REASONS = {
     "JP_VOLUME_TOO_LOW": "JP_VOLUME_TOO_LOW",
     "JP_VOLUME_TOO_HIGH": "JP_VOLUME_TOO_HIGH",
     "NEXT_3M_CONFIRMATION_FAILED": "NEXT_3M_CONFIRMATION_FAILED",
+    "JP_CONFIRMATION_LOW_VOLUME": "JP_CONFIRMATION_LOW_VOLUME",
+    "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW": "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW",
     "SETUP_EXPIRED": "SETUP_EXPIRED",
     "WAITING_FOR_1M_TRIGGER": "WAITING_FOR_1M_TRIGGER",
     "CANDLE_DATA_UNAVAILABLE": "CANDLE_DATA_UNAVAILABLE",
@@ -60,6 +74,43 @@ JP_REASONS = {
 
 # In-memory deduplication tracker: (symbol, strategy, side) -> (last_pattern_time, last_reason, last_status)
 _LAST_DIAGNOSTIC_STATE: Dict[Tuple[str, str, str], Tuple[str, str, str]] = {}
+
+
+def market_regime_allows_setup(
+    direction: str,
+    market_regime: str,
+    pct_change: float,
+    confirmation_volume_ratio: float | None = None,
+):
+    """
+    Return (allowed: bool, mode: str, reason: str).
+    Direction is BUY or SELL.
+    Market regime is BULLISH, BEARISH, NEUTRAL, or UNKNOWN.
+    """
+    market_regime = (market_regime or "UNKNOWN").upper()
+    direction = direction.upper()
+    abs_move = abs(float(pct_change or 0.0))
+
+    aligned = (
+        (direction == "BUY" and market_regime == "BULLISH")
+        or (direction == "SELL" and market_regime == "BEARISH")
+    )
+
+    if aligned:
+        if abs_move >= config.REGIME_ALIGNED_MIN_STOCK_MOVE_PCT:
+            return True, "ALIGNED", "REGIME_ALIGNED"
+        return False, "ALIGNED", "MOVE_TOO_SMALL"
+
+    if market_regime in ("UNKNOWN", "NEUTRAL"):
+        if abs_move >= config.REGIME_NEUTRAL_MIN_STOCK_MOVE_PCT:
+            return True, "NEUTRAL", "REGIME_NEUTRAL_STRENGTH_OK"
+        return False, "NEUTRAL", "NEUTRAL_REGIME_MOVE_TOO_SMALL"
+
+    # Countertrend: allowed only with substantial relative strength/weakness.
+    if abs_move < config.REGIME_COUNTERTREND_MIN_STOCK_MOVE_PCT:
+        return False, "COUNTERTREND", "COUNTERTREND_MOVE_TOO_SMALL"
+
+    return True, "COUNTERTREND", "COUNTERTREND_PENDING_STRONG_CONFIRMATION"
 
 
 def diagnose_alpha_candidate(
@@ -93,7 +144,29 @@ def diagnose_alpha_candidate(
         "metrics": {},
     }
 
-    if config.ALPHA_REQUIRE_MARKET_BULLISH and regime == "BEARISH":
+    regime_mode = "ALIGNED"
+    if getattr(config, "ALPHA_USE_MARKET_REGIME_FILTER", True):
+        allowed, regime_mode, regime_reason = market_regime_allows_setup(
+            direction=side,
+            market_regime=regime,
+            pct_change=pct_change,
+        )
+        diag_base["regime_mode"] = regime_mode
+        if not allowed:
+            diag_base["reason"] = regime_reason
+            req_thresh = (
+                config.REGIME_ALIGNED_MIN_STOCK_MOVE_PCT if regime_mode == "ALIGNED"
+                else (config.REGIME_NEUTRAL_MIN_STOCK_MOVE_PCT if regime_mode == "NEUTRAL"
+                      else config.REGIME_COUNTERTREND_MIN_STOCK_MOVE_PCT)
+            )
+            diag_base["metrics"] = {
+                "market_regime": regime,
+                "pct_change": pct_change,
+                "required_move_pct": req_thresh,
+                "regime_mode": regime_mode,
+            }
+            return diag_base
+    elif config.ALPHA_REQUIRE_MARKET_BULLISH and regime == "BEARISH":
         diag_base["reason"] = "MARKET_REGIME_BLOCKED"
         diag_base["metrics"] = {"market_regime": regime}
         return diag_base
@@ -104,9 +177,9 @@ def diagnose_alpha_candidate(
 
     df = today_pattern_candles.reset_index(drop=True)
     min_run = config.ALPHA_MIN_TREND_CANDLES
-    if len(df) < min_run + 2:
+    if len(df) < min_run + 1:
         diag_base["reason"] = "INSUFFICIENT_HISTORY"
-        diag_base["metrics"] = {"candles_count": len(df), "required": min_run + 2}
+        diag_base["metrics"] = {"candles_count": len(df), "required": min_run + 1}
         return diag_base
 
     last_candle = df.iloc[-1]
@@ -180,13 +253,22 @@ def diagnose_alpha_candidate(
         cand_win = df.iloc[max(0, a_idx - min_run):a_idx]
         t_vols = [float(c.volume) for _, c in cand_win.iterrows() if float(c.volume) > 0]
         rel_vol = pattern.relative_volume(alpha, t_vols)
-        if rel_vol > config.ALPHA_MAX_ALPHA_VOLUME_RATIO:
+
+        # Calculate SMMA bands for alpha if available
+        smma_len = getattr(config, "JP_SMMA_LENGTH", 10)
+        df_smma_high = jp_pattern.smma(df["high"], smma_len)
+        df_smma_close = jp_pattern.smma(df["close"], smma_len)
+        b_low = min(float(df_smma_high.iloc[a_idx]), float(df_smma_close.iloc[a_idx])) if pd.notna(df_smma_high.iloc[a_idx]) and pd.notna(df_smma_close.iloc[a_idx]) else float(alpha.low)
+        b_high = max(float(df_smma_high.iloc[a_idx]), float(df_smma_close.iloc[a_idx])) if pd.notna(df_smma_high.iloc[a_idx]) and pd.notna(df_smma_close.iloc[a_idx]) else float(alpha.high)
+
+        if not pattern.valid_alpha_pullback_candle(alpha, t_vols, band_low=b_low, band_high=b_high):
             rej = {
                 "reason": "ALPHA_EXCESS_REVERSAL_VOLUME",
                 "pattern_time": p_time,
                 "metrics": {
                     "relative_volume": round(rel_vol, 3),
                     "max_allowed": config.ALPHA_MAX_ALPHA_VOLUME_RATIO,
+                    "close_position": round(pattern.close_position_in_range(alpha), 3),
                 },
             }
             if best_rejection is None:
@@ -200,30 +282,15 @@ def diagnose_alpha_candidate(
         for idx in range(a_idx - 1, -1, -1):
             c = df.iloc[idx]
             rec_vols = df.iloc[max(0, idx - 3):idx]["volume"]
+            cand_b_low = min(float(df_smma_high.iloc[idx]), float(df_smma_close.iloc[idx])) if pd.notna(df_smma_high.iloc[idx]) and pd.notna(df_smma_close.iloc[idx]) else b_low
+            cand_b_high = max(float(df_smma_high.iloc[idx]), float(df_smma_close.iloc[idx])) if pd.notna(df_smma_high.iloc[idx]) and pd.notna(df_smma_close.iloc[idx]) else b_high
 
-            if not pattern.is_green(c):
-                trend_broken_reason = "TREND_NOT_GREEN"
-                trend_broken_metrics = {"candle_time": str(c.timestamp), "open": float(c.open), "close": float(c.close)}
+            is_valid, t_reason, t_metrics = pattern.valid_alpha_trend_candle(c, rec_vols, band_low=cand_b_low, band_high=cand_b_high)
+            if not is_valid:
+                trend_broken_reason = t_reason
+                trend_broken_metrics = {"candle_time": str(c.timestamp), **t_metrics}
                 break
-            if pattern.is_doji(c):
-                trend_broken_reason = "TREND_DOJI"
-                trend_broken_metrics = {"candle_time": str(c.timestamp), "body_ratio": round(pattern.candle_body_ratio(c), 3)}
-                break
-            tb_ratio = pattern.candle_body_ratio(c)
-            if tb_ratio < config.ALPHA_MIN_TREND_BODY_RATIO:
-                trend_broken_reason = "TREND_BODY_RATIO"
-                trend_broken_metrics = {"candle_time": str(c.timestamp), "body_ratio": round(tb_ratio, 3), "required": config.ALPHA_MIN_TREND_BODY_RATIO}
-                break
-            tb_to_w = pattern.body_to_wick_ratio(c)
-            if tb_to_w < config.ALPHA_MIN_TREND_BODY_TO_WICK_RATIO:
-                trend_broken_reason = "TREND_BODY_TO_WICK"
-                trend_broken_metrics = {"candle_time": str(c.timestamp), "body_to_wick_ratio": round(tb_to_w, 3), "required": config.ALPHA_MIN_TREND_BODY_TO_WICK_RATIO}
-                break
-            t_rel_vol = pattern.relative_volume(c, rec_vols)
-            if t_rel_vol < config.ALPHA_MIN_TREND_VOLUME_RATIO:
-                trend_broken_reason = "TREND_LOW_RELATIVE_VOLUME"
-                trend_broken_metrics = {"candle_time": str(c.timestamp), "relative_volume": round(t_rel_vol, 3), "required": config.ALPHA_MIN_TREND_VOLUME_RATIO}
-                break
+
             if reversed_run and float(reversed_run[-1].close) <= float(c.high):
                 trend_broken_reason = "TREND_CLOSE_NOT_ABOVE_PREVIOUS_HIGH"
                 trend_broken_metrics = {
@@ -248,19 +315,75 @@ def diagnose_alpha_candidate(
             continue
 
         # 6. Check confirmation
-        confirmations = df.iloc[a_idx + 1:a_idx + 1 + config.ALPHA_CONFIRMATION_PATTERN_BARS]
+        deadline_bars = getattr(config, "ALPHA_CONFIRMATION_DEADLINE_BARS", getattr(config, "ALPHA_CONFIRMATION_PATTERN_BARS", 2))
+        confirmations = df.iloc[a_idx + 1:a_idx + 1 + deadline_bars]
+        bars_seen = len(confirmations)
+
         confirmation = confirmations[
             (confirmations["high"] > float(alpha.high))
             & (confirmations["close"] > float(alpha.high))
-        ]
+        ] if not confirmations.empty else pd.DataFrame()
+
+        # If no bars exist yet or 1 non-confirming bar exists (and deadline has not passed), it is WAITING for confirmation!
         if confirmation.empty:
+            if bars_seen < deadline_bars:
+                diag_base["status"] = "WAITING"
+                diag_base["reason"] = "FIRST_CONFIRMATION_NOT_QUALIFIED" if bars_seen == 1 else "ALPHA_CANDIDATE_FORMED"
+                diag_base["pattern_time"] = p_time
+                diag_base["metrics"] = {
+                    "alpha_high": float(alpha.high),
+                    "alpha_low": float(alpha.low),
+                    "confirmation_bars_seen": bars_seen,
+                    "confirmation_bars_required": deadline_bars,
+                    "trend_length": len(reversed_run),
+                }
+                return diag_base
+
             rej = {
                 "reason": "NO_NEXT_TWO_3M_CONFIRMATION",
                 "pattern_time": p_time,
                 "metrics": {
                     "alpha_high": float(alpha.high),
-                    "bars_checked": len(confirmations),
-                    "max_bars": config.ALPHA_CONFIRMATION_PATTERN_BARS,
+                    "bars_checked": bars_seen,
+                    "max_bars": deadline_bars,
+                },
+            }
+            best_rejection = rej
+            continue
+
+        conf_candle = confirmation.iloc[0]
+        ref_vols = [float(alpha.volume)] + [float(c.volume) for c in reversed_run[:3] if float(c.volume) > 0]
+        conf_vol_ratio = pattern.relative_volume(conf_candle, ref_vols)
+        min_conf_vol = (
+            getattr(config, "REGIME_COUNTERTREND_MIN_CONFIRMATION_VOLUME_RATIO", 1.50)
+            if regime_mode == "COUNTERTREND"
+            else getattr(config, "ALPHA_CONFIRMATION_MIN_VOLUME_RATIO", 1.20)
+        )
+        if conf_vol_ratio < min_conf_vol:
+            if bars_seen < deadline_bars:
+                diag_base["status"] = "WAITING"
+                diag_base["reason"] = "FIRST_CONFIRMATION_NOT_QUALIFIED"
+                diag_base["pattern_time"] = p_time
+                diag_base["metrics"] = {
+                    "alpha_high": float(alpha.high),
+                    "confirmation_bars_seen": bars_seen,
+                    "confirmation_volume_ratio": round(conf_vol_ratio, 3),
+                    "min_required": min_conf_vol,
+                }
+                return diag_base
+
+            reason = (
+                "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW"
+                if regime_mode == "COUNTERTREND"
+                else "ALPHA_CONFIRMATION_LOW_VOLUME"
+            )
+            rej = {
+                "reason": reason,
+                "pattern_time": p_time,
+                "metrics": {
+                    "confirmation_volume_ratio": round(conf_vol_ratio, 3),
+                    "min_required": min_conf_vol,
+                    "regime_mode": regime_mode,
                 },
             }
             best_rejection = rej
@@ -310,6 +433,7 @@ def diagnose_jp_candidate(
     today_pattern_candles: Optional[pd.DataFrame],
     regime: str,
     now: datetime,
+    session_date=None,
 ) -> dict:
     """
     Evaluates JP setup rules step-by-step and returns structured diagnostic dict.
@@ -335,7 +459,29 @@ def diagnose_jp_candidate(
         "metrics": {},
     }
 
-    if config.JP_REQUIRE_MARKET_REGIME:
+    regime_mode = "ALIGNED"
+    if getattr(config, "JP_USE_MARKET_REGIME_FILTER", True):
+        allowed, regime_mode, regime_reason = market_regime_allows_setup(
+            direction=side,
+            market_regime=regime,
+            pct_change=pct_change,
+        )
+        diag_base["regime_mode"] = regime_mode
+        if not allowed:
+            diag_base["reason"] = regime_reason
+            req_thresh = (
+                config.REGIME_ALIGNED_MIN_STOCK_MOVE_PCT if regime_mode == "ALIGNED"
+                else (config.REGIME_NEUTRAL_MIN_STOCK_MOVE_PCT if regime_mode == "NEUTRAL"
+                      else config.REGIME_COUNTERTREND_MIN_STOCK_MOVE_PCT)
+            )
+            diag_base["metrics"] = {
+                "market_regime": regime,
+                "pct_change": pct_change,
+                "required_move_pct": req_thresh,
+                "regime_mode": regime_mode,
+            }
+            return diag_base
+    elif config.JP_REQUIRE_MARKET_REGIME:
         if (is_bullish_setup and regime != "BULLISH") or (not is_bullish_setup and regime != "BEARISH"):
             diag_base["reason"] = "MARKET_REGIME_BLOCKED"
             diag_base["metrics"] = {"market_regime": regime, "required": "BULLISH" if is_bullish_setup else "BEARISH"}
@@ -376,10 +522,16 @@ def diagnose_jp_candidate(
                                 max(float(row.jp_smma_high), float(row.jp_smma_close)))
         for _, row in prior.iterrows()
     )
+    compression_valid = False
     if prior_touch_count > config.JP_MAX_PRIOR_BAND_TOUCHES:
-        diag_base["reason"] = "PRIOR_BAND_CHOP"
-        diag_base["metrics"] = {"prior_touches": prior_touch_count, "max_allowed": config.JP_MAX_PRIOR_BAND_TOUCHES}
-        return diag_base
+        if getattr(config, "JP_ALLOW_CONSTRUCTIVE_COMPRESSION", True) and jp_pattern.constructive_compression(
+            prior, band_low, band_high, bullish=is_bullish_setup
+        ):
+            compression_valid = True
+        else:
+            diag_base["reason"] = "PRIOR_BAND_CHOP"
+            diag_base["metrics"] = {"prior_touches": prior_touch_count, "max_allowed": config.JP_MAX_PRIOR_BAND_TOUCHES}
+            return diag_base
 
     # Trend side count
     if is_bullish_setup:
@@ -460,6 +612,30 @@ def diagnose_jp_candidate(
                 "conf_low": float(confirmation.low),
             }
             return diag_base
+
+        conf_vol = float(confirmation.volume)
+        conf_ref = float(prior["volume"].median()) if not prior.empty and float(prior["volume"].median()) > 0 else float(candle.volume)
+        conf_vol_ratio = conf_vol / conf_ref if conf_ref > 0 else 1.0
+        min_conf_vol = (
+            getattr(config, "REGIME_COUNTERTREND_MIN_CONFIRMATION_VOLUME_RATIO", 1.50)
+            if regime_mode == "COUNTERTREND"
+            else getattr(config, "JP_CONFIRMATION_MIN_VOLUME_RATIO", 1.20)
+        )
+        if conf_vol_ratio < min_conf_vol:
+            reason = (
+                "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW"
+                if regime_mode == "COUNTERTREND"
+                else "JP_CONFIRMATION_LOW_VOLUME"
+            )
+            diag_base["reason"] = reason
+            diag_base["metrics"] = {
+                "confirmation_volume_ratio": round(conf_vol_ratio, 3),
+                "min_required": min_conf_vol,
+                "regime_mode": regime_mode,
+            }
+            return diag_base
+    else:
+        conf_vol_ratio = 1.0
 
     # Pattern detected! Check expiry or waiting
     c_open_time = candle.timestamp.to_pydatetime() if hasattr(candle.timestamp, "to_pydatetime") else candle.timestamp
