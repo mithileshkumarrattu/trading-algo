@@ -111,7 +111,7 @@ def notify_alpha_candle_confirmed(symbol, direction, alpha_time, alpha_high, alp
     )
 
 
-def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_price, band_low, band_high, band_interaction="TOUCH", quality_score=None, warnings=None):
+def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_price, band_low, band_high, band_interaction="BAND_TOUCH", quality_score=None, warnings=None):
     arrow = "🟢" if direction == "BUY" else "🔴"
     level_name = "JP High" if direction == "BUY" else "JP Low"
     mode_line = (
@@ -125,11 +125,12 @@ def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_pr
         score_line = f"\nQuality: {quality_score}/100 | Band: {band_interaction} | Notes: {warn_str}"
 
     send_telegram(
-        f"{arrow} <b>{symbol}</b> — JP Candidate ({direction} - {band_interaction})\n"
+        f"{arrow} <b>{symbol}</b> — JP Pullback Setup ({direction})\n"
         f"Pattern candle: {jp_time}\n"
         f"SMMA band: ₹{band_low:.2f} – ₹{band_high:.2f}\n"
         f"Trigger level ({level_name}): ₹{trigger_price:.2f} | SL: ₹{stop_price:.2f}\n"
-        f"{mode_line}{score_line}"
+        f"{mode_line}{score_line}\n"
+        f"Awaiting 1m breakout close confirmation."
     )
 
 

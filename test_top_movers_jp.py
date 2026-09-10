@@ -1050,7 +1050,7 @@ def test_jp_volume_hard_floor_vs_soft_warning():
     ]
     assert jp_pattern.find_jp_setup(pd.DataFrame(c_fail), is_bullish_setup=True) is None
 
-    # 2. Volume ratio 0.70x (between 0.60 and 0.80) -> Passes with LOW_JP_VOLUME warning
+    # 2. Volume ratio 0.70x (between 0.60 and 0.80) -> Passes pattern check as OBSERVATION (due to disqualifying warning LOW_JP_VOLUME)
     c_warn = candles + [
         {"timestamp": now - timedelta(minutes=6), "open": price, "high": price + 0.1, "low": band_c - 0.2, "close": band_c + 0.5, "volume": 700},
         {"timestamp": now - timedelta(minutes=3), "open": band_c + 0.5, "high": price + 1.0, "low": band_c + 0.3, "close": price + 0.8, "volume": 1500}
@@ -1058,8 +1058,10 @@ def test_jp_volume_hard_floor_vs_soft_warning():
     res_warn = jp_pattern.find_jp_setup(pd.DataFrame(c_warn), is_bullish_setup=True)
     assert res_warn is not None
     assert "LOW_JP_VOLUME" in res_warn["quality_warnings"]
+    assert res_warn["status"] == "OBSERVATION"
+    assert res_warn["is_candidate"] is False
 
-    # 3. Volume ratio 1.00x >= 0.80 -> Clean
+    # 3. Volume ratio 1.00x >= 0.80 -> Clean CANDIDATE
     c_clean = candles + [
         {"timestamp": now - timedelta(minutes=6), "open": price, "high": price + 0.1, "low": band_c - 0.2, "close": band_c + 0.5, "volume": 1000},
         {"timestamp": now - timedelta(minutes=3), "open": band_c + 0.5, "high": price + 1.0, "low": band_c + 0.3, "close": price + 0.8, "volume": 1500}
@@ -1067,6 +1069,8 @@ def test_jp_volume_hard_floor_vs_soft_warning():
     res_clean = jp_pattern.find_jp_setup(pd.DataFrame(c_clean), is_bullish_setup=True)
     assert res_clean is not None
     assert "LOW_JP_VOLUME" not in res_clean["quality_warnings"]
+    assert res_clean["status"] == "CANDIDATE"
+    assert res_clean["is_candidate"] is True
 
 
 def test_jp_near_band_tolerance_and_max_points_cap():
@@ -1135,4 +1139,107 @@ def test_telegram_notifications_do_not_send_rejections(monkeypatch):
     # Rejections logged to state only
     state.add_log("REJECTED: some filter failed")
     assert len(sent_messages) == 0
+
+
+def test_jp_near_band_with_multiple_warnings_is_observation_not_candidate():
+    """Verify that a candle that is only BAND_NEAR and has multiple warnings is classified as OBSERVATION, not CANDIDATE."""
+    now = datetime(2026, 9, 10, 10, 0, tzinfo=config.TIME_ZONE)
+    candles = []
+    price = 100.0
+    for i in range(13):
+        candles.append({
+            "timestamp": now - timedelta(minutes=(15 - i) * 3),
+            "open": price, "high": price + 1.5, "low": price - 0.2, "close": price + 1.2, "volume": 1000
+        })
+        price += 1.2
+
+    # Open=110.0, Close=109.4, High=110.1, Low=109.30 (low sits slightly above band_high ~109.23, within 0.15% tolerance)
+    # volume=700 introduces LOW_JP_VOLUME warning -> multiple warnings (BAND_NEAR + LOW_JP_VOLUME)
+    c_kalyan = candles + [
+        {"timestamp": now - timedelta(minutes=6), "open": 110.0, "high": 110.1, "low": 109.30, "close": 109.4, "volume": 700},
+        {"timestamp": now - timedelta(minutes=3), "open": 109.4, "high": 113.0, "low": 109.4, "close": 112.5, "volume": 1500}
+    ]
+    res = jp_pattern.find_jp_setup(pd.DataFrame(c_kalyan), is_bullish_setup=True)
+    assert res is not None
+    assert res["status"] == "OBSERVATION"
+    assert res["is_candidate"] is False
+    assert res["band_interaction"] == "BAND_NEAR"
+    assert res["quality_score"] < getattr(config, "JP_MIN_CANDIDATE_QUALITY_SCORE", 75) or len(res["quality_warnings"]) > 1
+
+
+def test_jp_1m_entry_requires_close_confirmation(monkeypatch):
+    """Verify that a 1m bar with high > trigger but close <= trigger is NOT entered for JP."""
+    monkeypatch.setattr(config, "JP_DETECTION_ONLY", False)
+    captured = {}
+
+    def fake_enter_trade(*args, **kwargs):
+        captured.update(kwargs)
+        return {"order_id": "PAPER-JP"}
+
+    monkeypatch.setattr(main.engine, "enter_trade", fake_enter_trade)
+    monkeypatch.setattr(main.state, "snapshot", lambda: {"open_positions": {}})
+    monkeypatch.setattr(main.state, "set_jp_watchlist_item", lambda sid, item: None)
+    monkeypatch.setattr(main.state, "remove_alpha_setup", lambda sid: None)
+    monkeypatch.setattr(main.state, "remove_jp_setup", lambda sid: None)
+    monkeypatch.setattr(main.state, "log_setup_outcome", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.state, "add_log", lambda *args, **kwargs: None)
+    
+    class DateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 3, 10, 5, tzinfo=tz)
+
+    monkeypatch.setattr(main, "datetime", DateTime)
+
+    setup = {
+        "security_id": "42", "symbol": "TEST", "strategy": "JP", "direction": "BUY",
+        "trigger_price": 101.0, "pattern_high": 101.0, "pattern_low": 99.0,
+        "pattern_open_time": "2026-09-03T10:00:00+05:30",
+        "pattern_close_time": "2026-09-03T10:03:00+05:30", "setup_key": "JP-42",
+    }
+
+    # 1. Wick crosses above 101.0 (high=101.3) but close is 100.8 <= 101.0 -> NO entry
+    bar_wick_only = {
+        "timestamp": datetime(2026, 9, 3, 10, 4, tzinfo=DateTime.now().tzinfo),
+        "open": 100.0, "high": 101.3, "low": 100.0, "close": 100.8,
+    }
+    class Broker:
+        def get_ltp(self, security_id, exchange):
+            return 100.8
+
+    res_wick = main.process_new_1m_bar_for_setup(Broker(), setup, bar_wick_only)
+    assert res_wick is None
+    assert "order_id" not in captured
+
+    # 2. Both high and close above 101.0 (high=101.5, close=101.2) on next 1m bar -> Creates paper entry
+    bar_close_confirmed = {
+        "timestamp": datetime(2026, 9, 3, 10, 5, tzinfo=DateTime.now().tzinfo),
+        "open": 100.0, "high": 101.5, "low": 100.0, "close": 101.2,
+    }
+    class BrokerConfirmed:
+        def get_ltp(self, security_id, exchange):
+            return 101.2
+
+    res_close = main.process_new_1m_bar_for_setup(BrokerConfirmed(), setup, bar_close_confirmed)
+    assert res_close == "TRADE_ENTERED"
+    assert captured["strategy"] == "JP"
+
+
+def test_alpha_candidate_promotion_and_observation_rules():
+    """Verify Alpha candidate with quality score >= 70 is promoted as CANDIDATE."""
+    now = datetime(2026, 9, 10, 12, 0, tzinfo=config.TIME_ZONE)
+    candles = [
+        {"timestamp": now - timedelta(minutes=15), "open": 100.0, "high": 102.0, "low": 99.8, "close": 101.8, "volume": 1000},
+        {"timestamp": now - timedelta(minutes=12), "open": 101.8, "high": 104.0, "low": 101.5, "close": 103.8, "volume": 1000},
+        {"timestamp": now - timedelta(minutes=9), "open": 103.8, "high": 106.0, "low": 103.5, "close": 105.8, "volume": 1000},
+        # Candidate Red Alpha Pullback holding support with clean volume
+        {"timestamp": now - timedelta(minutes=6), "open": 105.8, "high": 106.0, "low": 104.5, "close": 104.8, "volume": 1000},
+    ]
+    df = pd.DataFrame(candles)
+    res = pattern.find_alpha_setup(df, side="BUY")
+    assert res is not None
+    assert res["is_candidate"] is True
+    assert res["quality_score"] >= getattr(config, "ALPHA_MIN_CANDIDATE_QUALITY_SCORE", 70)
+    assert res["stage"] == "WAITING_3M_CONFIRMATION"
+
 

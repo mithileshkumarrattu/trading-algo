@@ -305,9 +305,31 @@ def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool, session
         quality_score -= 10
     quality_score = max(30, min(100, quality_score))
 
+    # Determine status: OBSERVATION vs CANDIDATE
+    # A true candidate requires actual band touch, minimum score, max warnings, and no disqualifying warning.
+    is_candidate = (
+        interaction_type == "BAND_TOUCH"
+        and quality_score >= getattr(config, "JP_MIN_CANDIDATE_QUALITY_SCORE", 75)
+        and len(warnings) <= getattr(config, "JP_MAX_CANDIDATE_WARNINGS", 1)
+        and not any(w in getattr(config, "JP_DISQUALIFYING_WARNINGS", ()) for w in warnings)
+    )
+
+    if not is_candidate:
+        if getattr(config, "JP_NEAR_BAND_CAN_CREATE_OBSERVATION", True):
+            status = "OBSERVATION"
+            stage = "OBSERVATION"
+        else:
+            return None
+    else:
+        status = "CANDIDATE"
+        stage = "AWAITING_1M_TRIGGER"
+
     return {
         "strategy": "JP",
         "direction": direction,
+        "status": status,
+        "stage": stage,
+        "is_candidate": is_candidate,
         "jp_candle": candle,
         "jp_index": jp_index,
         "jp_open_time": candle_open_time,

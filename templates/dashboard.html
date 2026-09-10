@@ -681,9 +681,9 @@
     .position-side.buy { color: var(--green-strong); }
     .position-side.sell { color: var(--red); }
 
-    @media (max-width: 1800px) {
+    @media (max-width: 1400px) {
       .app-shell {
-        grid-template-columns: 220px minmax(0, 1fr);
+        grid-template-columns: 240px minmax(0, 1fr);
       }
 
       .right-panel {
@@ -694,20 +694,33 @@
       .right-panel .market-list {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
       }
 
       .center-grid { grid-template-columns: 1fr; }
     }
 
-    @media (max-width: 980px) {
+    @media (max-width: 1024px) {
+      .top-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 860px) {
       .app-shell {
         grid-template-columns: 1fr;
+        gap: 14px;
       }
 
       .sidebar,
       .right-panel {
         position: static;
+        width: 100%;
       }
+
+      .sidebar { order: 2; }
+      .main-panel { order: 1; }
+      .right-panel { order: 3; }
 
       .top-grid,
       .center-grid {
@@ -717,30 +730,25 @@
       .right-panel .market-list {
         grid-template-columns: 1fr;
       }
-
-      .top-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .sidebar { order: 2; }
-      .main-panel { order: 1; }
-      .right-panel { order: 3; }
     }
 
     @media (max-width: 640px) {
-      body { padding: 10px; }
-      .app-shell { gap: 12px; min-height: auto; }
-      .glass { border-radius: 18px; }
-      .top-grid { grid-template-columns: 1fr; gap: 12px; }
-      .hero-card, .stack-card, .small-card { padding: 14px; }
+      body { padding: 8px; }
+      .app-shell { gap: 10px; min-height: auto; }
+      .glass { border-radius: 16px; }
+      .top-grid { grid-template-columns: 1fr; gap: 10px; }
+      .hero-card, .stack-card, .small-card { padding: 12px; }
       .hero-card { min-height: 0; }
-      .hero-value { font-size: 2rem; }
-      .center-grid { gap: 12px; }
+      .hero-value { font-size: 1.8rem; }
+      .center-grid { gap: 10px; }
       .sidebar, .right-panel { padding: 12px; }
-      .brand-row { padding: 4px 4px 12px; }
+      .brand-row { padding: 4px 4px 10px; }
       .trend-card { margin-top: 4px; }
-      .right-panel .stack-card { padding: 14px; }
+      .right-panel .stack-card { padding: 12px; }
       .table-wrap { border-radius: 12px; }
-      thead th, tbody td { padding: 9px 10px; }
-      .market-list { margin-top: 12px; }
-      .log-box { min-height: 180px; max-height: 260px; }
+      thead th, tbody td { padding: 8px 8px; font-size: 0.72rem; }
+      .market-list { margin-top: 10px; }
+      .log-box { min-height: 160px; max-height: 240px; }
     }
   </style>
 </head>

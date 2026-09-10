@@ -398,12 +398,20 @@ def find_alpha_setup(pattern_candles, side="BUY"):
         else:
             stage = "WAITING_3M_CONFIRMATION"
 
+        # Determine candidate promotion eligibility
+        is_candidate = (
+            quality_score >= getattr(config, "ALPHA_MIN_CANDIDATE_QUALITY_SCORE", 70)
+            and len(all_warnings) <= getattr(config, "ALPHA_MAX_CANDIDATE_WARNINGS", 1)
+            and not any(w in getattr(config, "ALPHA_DISQUALIFYING_WARNINGS", ()) for w in all_warnings)
+        )
+
         return {
             "strategy": "ALPHA",
             "side": side,
             "direction": side,
             "status": pattern_confirmation_status,
             "stage": stage,
+            "is_candidate": is_candidate,
             "alpha_candle": alpha,
             "alpha_idx": alpha_idx,
             "alpha_open_time": alpha_open_time,

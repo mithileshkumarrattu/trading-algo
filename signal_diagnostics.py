@@ -545,7 +545,7 @@ def diagnose_jp_candidate(
         return diag_base
 
     # Band touch / near band interaction
-    interacts, band_interaction = jp_pattern.jp_interacts_with_band(candle, band_low, band_high)
+    interacts, band_interaction = jp_pattern.jp_interacts_with_band(candle, band_low, band_high, side=side)
     if not interacts:
         diag_base["reason"] = "JP_NO_BAND_TOUCH"
         diag_base["metrics"] = {
@@ -553,6 +553,18 @@ def diagnose_jp_candidate(
             "low": float(candle.low),
             "band_low": round(band_low, 2),
             "band_high": round(band_high, 2),
+        }
+        return diag_base
+
+    if band_interaction == "BAND_NEAR" and getattr(config, "JP_REQUIRE_ACTUAL_BAND_TOUCH_FOR_CANDIDATE", True):
+        diag_base["reason"] = "JP_BAND_NEAR_OBSERVATION_ONLY"
+        diag_base["band_interaction"] = "BAND_NEAR"
+        diag_base["metrics"] = {
+            "high": float(candle.high),
+            "low": float(candle.low),
+            "band_low": round(band_low, 2),
+            "band_high": round(band_high, 2),
+            "note": "Observation only; candidate requires actual touch",
         }
         return diag_base
 

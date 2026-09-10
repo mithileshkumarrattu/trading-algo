@@ -147,12 +147,25 @@ def remove_alpha_watchlist_item(security_id):
 def get_active_alpha_setups():
     data = snapshot()
     alpha = data.get("alpha_watchlist") or data.get("watchlist") or {}
-    return list(alpha.values())
+    return [s for s in alpha.values() if s.get("stage") != "OBSERVATION"]
 
 
 def get_active_jp_setups():
     data = snapshot()
-    return list((data.get("jp_watchlist") or {}).values())
+    jp = data.get("jp_watchlist") or {}
+    return [s for s in jp.values() if s.get("stage") != "OBSERVATION"]
+
+
+def has_active_setup_for_security(security_id) -> bool:
+    data = snapshot()
+    sid = str(security_id)
+    alpha = data.get("alpha_watchlist", {}).get(sid) or data.get("watchlist", {}).get(sid)
+    jp = data.get("jp_watchlist", {}).get(sid)
+    if alpha and alpha.get("stage") in ("WAITING_3M_CONFIRMATION", "WAITING_SECOND_3M_CONFIRMATION", "AWAITING_BREAKOUT", "AWAITING_1M_TRIGGER"):
+        return True
+    if jp and jp.get("stage") in ("AWAITING_1M_TRIGGER", "WAITING_3M_CONFIRMATION"):
+        return True
+    return False
 
 
 def set_open_position(security_id, item: dict):

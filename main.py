@@ -10,6 +10,7 @@ No dependency on any file outside this folder.
 """
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from logging import getLogger
@@ -32,10 +33,12 @@ import notifier
 from broker import DhanBroker
 
 _stop_event = threading.Event()
+_cache_lock = threading.Lock()
 _candle_cache = {}
 _pattern_candle_cache = {}
 _jp_pattern_candle_cache = {}
 _processed_alpha_1m_candles = set()
+_processed_alpha_lock = threading.Lock()
 
 
 def validate_runtime_config():
@@ -51,9 +54,10 @@ def validate_runtime_config():
 def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seconds):
     key = f"{security_id}_{timeframe}"
     now = time.time()
-    cached = _candle_cache.get(key)
-    if cached and now - cached["fetched_at"] < ttl_seconds:
-        return cached["data"]
+    with _cache_lock:
+        cached = _candle_cache.get(key)
+        if cached and now - cached["fetched_at"] < ttl_seconds:
+            return cached["data"]
 
     candles = broker.get_intraday_candles(
         security_id=security_id,
@@ -63,23 +67,26 @@ def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seco
         timeframe=timeframe,
     )
     if candles is not None and not candles.empty:
-        _candle_cache[key] = {"fetched_at": now, "data": candles}
+        with _cache_lock:
+            _candle_cache[key] = {"fetched_at": now, "data": candles}
     return candles
 
 
 def get_cached_pattern_candles(broker, security_id, prev_trade_date, timeframe):
     key = f"{security_id}_{timeframe}"
     now = time.time()
-    cached = _pattern_candle_cache.get(key)
-    if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
-        return cached["data"]
+    with _cache_lock:
+        cached = _pattern_candle_cache.get(key)
+        if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
+            return cached["data"]
     candles = broker.get_pattern_candles(
         security_id=security_id, exchange_segment=config.EXCHANGE,
         instrument_type="EQUITY", from_dt=prev_trade_date,
         pattern_timeframe=timeframe,
     )
     if candles is not None and not candles.empty:
-        _pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
+        with _cache_lock:
+            _pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
     return candles
 
 
@@ -89,9 +96,10 @@ def get_cached_jp_pattern_candles_with_warmup(broker, security_id, prev_trade_da
 
     key = f"JP_WARMUP_{security_id}"
     now = time.time()
-    cached = _jp_pattern_candle_cache.get(key)
-    if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
-        return cached["data"]
+    with _cache_lock:
+        cached = _jp_pattern_candle_cache.get(key)
+        if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
+            return cached["data"]
 
     candles = broker.get_pattern_candles_with_warmup(
         security_id=security_id,
@@ -101,7 +109,8 @@ def get_cached_jp_pattern_candles_with_warmup(broker, security_id, prev_trade_da
         pattern_timeframe=config.JP_TIMEFRAME,
     )
     if candles is not None and not candles.empty:
-        _jp_pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
+        with _cache_lock:
+            _jp_pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
     return candles
 
 
@@ -133,9 +142,10 @@ def check_alpha_entry(broker, security_id, symbol, is_bullish_setup,
     for _, candle in eligible.iterrows():
         candle_time = candle["timestamp"].isoformat()
         processed_key = f"{alpha_key}_{candle_time}"
-        if processed_key in _processed_alpha_1m_candles:
-            continue
-        _processed_alpha_1m_candles.add(processed_key)
+        with _processed_alpha_lock:
+            if processed_key in _processed_alpha_1m_candles:
+                continue
+            _processed_alpha_1m_candles.add(processed_key)
 
         high = float(candle["high"])
         low = float(candle["low"])
@@ -237,7 +247,10 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
     if trigger_level <= 0:
         return None
 
-    crossed = high > trigger_level if direction == "BUY" else low < trigger_level
+    if strategy == "JP":
+        crossed = (high > trigger_level and close > trigger_level) if direction == "BUY" else (low < trigger_level and close < trigger_level)
+    else:
+        crossed = high > trigger_level if direction == "BUY" else low < trigger_level
     setup["last_processed_1m_time"] = bar_time_iso
     if strategy == "JP":
         state.set_jp_watchlist_item(security_id, setup)
@@ -547,9 +560,11 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
 
     if state.jp_signal_count(security_id) >= config.JP_MAX_SIGNALS_PER_SYMBOL_PER_DAY:
         return
-    snap = state.snapshot()
-    if str(security_id) in snap.get("open_positions", {}):
-        return
+    # Check collision protection: do not overwrite active Alpha setup with JP
+    if state.has_active_setup_for_security(security_id):
+        active_alpha = state.snapshot().get("alpha_watchlist", {}).get(str(security_id)) or state.snapshot().get("watchlist", {}).get(str(security_id))
+        if active_alpha and active_alpha.get("stage") in ("WAITING_3M_CONFIRMATION", "WAITING_SECOND_3M_CONFIRMATION", "AWAITING_BREAKOUT", "AWAITING_1M_TRIGGER"):
+            return
 
     try:
         candles_3m = get_cached_jp_pattern_candles_with_warmup(broker, security_id, prev_trade_date)
@@ -562,6 +577,11 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
     today = datetime.now(config.TIME_ZONE).date()
     result = jp_pattern.find_jp_setup(candles_3m, is_bullish_setup, session_date=today)
     if result is None:
+        return
+
+    # If it's only an observation, log diagnostic but do NOT store in tradeable watchlist and do NOT send Telegram alert
+    if result.get("status") == "OBSERVATION" or not result.get("is_candidate", True):
+        state.add_log(f"{symbol}: JP Observation ({result['direction']} - {result.get('band_interaction')}) Q={result.get('quality_score')} Notes={result.get('quality_warnings')}")
         return
 
     # If countertrend, verify stricter confirmation volume threshold
@@ -622,7 +642,7 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
     state.set_jp_watchlist_item(security_id, item)
     state.mark_jp_alerted(key)
     state.add_log(
-        f"{symbol}: JP {result['direction']} detected at {result['jp_open_time'].isoformat()} "
+        f"{symbol}: JP {result['direction']} candidate detected at {result['jp_open_time'].isoformat()} "
         f"trigger={result['trigger_price']:.2f} SL={result['stop_price']:.2f} [{regime_mode}] Q={item['quality_score']}"
     )
     state.increment_jp_signal_count(security_id)
@@ -839,6 +859,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
         "is_bullish_setup": is_bullish_setup,
         "direction": direction,
         "stage": stage,
+        "is_candidate": result.get("is_candidate", True),
         "alpha_high": float(alpha.high),
         "alpha_low": float(alpha.low),
         "trigger_price": float(alpha.high if is_bullish_setup else alpha.low),
@@ -877,20 +898,24 @@ def scan_candidate(broker, candidate, prev_trade_date):
     }
     state.set_watchlist_item(security_id, item)
 
+    # Only promote to Telegram watch if it meets candidate quality thresholds
     if stage == "WAITING_3M_CONFIRMATION" and not state.has_alerted(dedup_key):
-        if config.SEND_TELEGRAM_ON_SETUP_WATCH:
-            notifier.notify_alpha_candle_detected(
-                symbol=symbol,
-                direction=direction,
-                alpha_time=str(alpha.timestamp),
-                alpha_high=float(alpha.high),
-                alpha_low=float(alpha.low),
-                timeframe=config.PATTERN_TIMEFRAME,
-                quality_score=item.get("quality_score"),
-                warnings=item.get("quality_warnings"),
-            )
-        state.mark_alerted(dedup_key)
-        state.add_log(f"{symbol}: Alpha Candidate detected ({direction}) at {alpha.timestamp} [{regime_mode}] Q={item.get('quality_score')}")
+        if result.get("is_candidate", True):
+            if config.SEND_TELEGRAM_ON_SETUP_WATCH:
+                notifier.notify_alpha_candle_detected(
+                    symbol=symbol,
+                    direction=direction,
+                    alpha_time=str(alpha.timestamp),
+                    alpha_high=float(alpha.high),
+                    alpha_low=float(alpha.low),
+                    timeframe=config.PATTERN_TIMEFRAME,
+                    quality_score=item.get("quality_score"),
+                    warnings=item.get("quality_warnings"),
+                )
+            state.mark_alerted(dedup_key)
+            state.add_log(f"{symbol}: Alpha Candidate detected ({direction}) at {alpha.timestamp} [{regime_mode}] Q={item.get('quality_score')}")
+        else:
+            state.add_log(f"{symbol}: Alpha Observation ({direction}) at {alpha.timestamp} [{regime_mode}] Q={item.get('quality_score')} Notes={item.get('quality_warnings')}")
     elif stage == "AWAITING_BREAKOUT":
         conf_dedup = dedup_key + "_CONFIRMED"
         if not state.has_alerted(conf_dedup):
@@ -1083,14 +1108,23 @@ def scan_loop(broker, prev_trade_date):
                         logger.exception(f"1m event processing failed for {symbol_setups[0].get('symbol', sid)}")
 
                 candidates = build_scan_candidates()
-                for cand in candidates:
-                    scan_candidate(broker, cand, prev_trade_date)
-                    if getattr(config, "OPENING_MOMENTUM_ENABLED", True):
-                        scan_opening_momentum_candidate(broker, cand, prev_trade_date)
-                    time.sleep(0.2)
-                for cand in build_jp_scan_candidates():
-                    scan_jp_candidate(broker, cand, prev_trade_date)
-                    time.sleep(0.2)
+                jp_candidates = build_jp_scan_candidates()
+
+                # Parallel scan across candidates universe (Top 20 Gainers + Top 20 Losers + Top 5 Volume Leaders)
+                with ThreadPoolExecutor(max_workers=6) as executor:
+                    futures = []
+                    for cand in candidates:
+                        futures.append(executor.submit(scan_candidate, broker, cand, prev_trade_date))
+                        if getattr(config, "OPENING_MOMENTUM_ENABLED", True):
+                            futures.append(executor.submit(scan_opening_momentum_candidate, broker, cand, prev_trade_date))
+                    for cand in jp_candidates:
+                        futures.append(executor.submit(scan_jp_candidate, broker, cand, prev_trade_date))
+
+                    for f in as_completed(futures):
+                        try:
+                            f.result()
+                        except Exception:
+                            logger.exception("Error during parallel candidate scan")
 
             for sid in list(state.snapshot()["open_positions"].keys()):
                 if config.PAPER_MODE:
