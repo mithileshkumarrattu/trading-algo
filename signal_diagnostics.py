@@ -544,8 +544,9 @@ def diagnose_jp_candidate(
         diag_base["metrics"] = {"trend_side_bars": trend_side_count, "required": config.JP_MIN_PRIOR_BARS_TREND_SIDE}
         return diag_base
 
-    # Band touch
-    if not jp_pattern.touches_band(candle, band_low, band_high):
+    # Band touch / near band interaction
+    interacts, band_interaction = jp_pattern.jp_interacts_with_band(candle, band_low, band_high)
+    if not interacts:
         diag_base["reason"] = "JP_NO_BAND_TOUCH"
         diag_base["metrics"] = {
             "high": float(candle.high),
@@ -555,6 +556,14 @@ def diagnose_jp_candidate(
         }
         return diag_base
 
+    # Body to wick ratio (hard floor)
+    b_to_w = jp_pattern.body_to_wick_ratio(candle)
+    hard_b_to_w = getattr(config, "JP_MIN_BODY_TO_WICK_HARD", 0.75)
+    if b_to_w < hard_b_to_w:
+        diag_base["reason"] = "JP_BODY_TO_WICK"
+        diag_base["metrics"] = {"body_to_wick_ratio": round(b_to_w, 3) if b_to_w != float("inf") else 999.0, "required": hard_b_to_w}
+        return diag_base
+
     # Body ratio
     b_ratio = jp_pattern._body_ratio(candle)
     if b_ratio < config.JP_MIN_BODY_RATIO:
@@ -562,12 +571,13 @@ def diagnose_jp_candidate(
         diag_base["metrics"] = {"body_ratio": round(b_ratio, 3), "required": config.JP_MIN_BODY_RATIO}
         return diag_base
 
-    # Volume ratio
+    # Volume ratio (hard floor)
     ref_vol = float(prior["volume"].median()) if not prior.empty else 0.0
     vol_ratio = float(candle.volume) / ref_vol if ref_vol > 0 else 1.0
-    if vol_ratio < config.JP_MIN_VOLUME_RATIO:
+    hard_min_vol = getattr(config, "JP_MIN_VOLUME_RATIO_HARD", 0.60)
+    if vol_ratio < hard_min_vol:
         diag_base["reason"] = "JP_VOLUME_TOO_LOW"
-        diag_base["metrics"] = {"volume_ratio": round(vol_ratio, 3), "min_required": config.JP_MIN_VOLUME_RATIO}
+        diag_base["metrics"] = {"volume_ratio": round(vol_ratio, 3), "min_required": hard_min_vol}
         return diag_base
     if vol_ratio > config.JP_MAX_VOLUME_RATIO:
         diag_base["reason"] = "JP_VOLUME_TOO_HIGH"

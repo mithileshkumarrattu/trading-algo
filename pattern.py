@@ -163,49 +163,30 @@ def valid_alpha_trend_candle(candle, recent_volumes, band_low=None, band_high=No
     if is_doji(candle):
         return False, "TREND_DOJI", {"body_ratio": round(br, 3)}
 
-    # Hard safety rule: wicks must not dominate body
-    if bwr < getattr(config, "ALPHA_MIN_TREND_BODY_TO_WICK_RATIO", 1.0):
+    # Hard safety rule: body to wick must not fall below hard threshold (0.75)
+    hard_bwr = getattr(config, "ALPHA_MIN_TREND_BODY_TO_WICK_HARD", 0.75)
+    if bwr < hard_bwr:
         return False, "TREND_BODY_TO_WICK", {
             "body_to_wick_ratio": round(bwr, 3),
+            "required": hard_bwr,
         }
 
-    # Normal strong momentum candle
-    if (
-        br >= getattr(config, "ALPHA_MIN_TREND_BODY_RATIO", 0.45)
-        and vr >= getattr(config, "ALPHA_MIN_TREND_VOLUME_RATIO", 0.90)
-    ):
-        return True, "TREND_STRONG", {
-            "body_ratio": round(br, 3),
-            "volume_ratio": round(vr, 3),
-        }
+    warnings = []
+    soft_br = getattr(config, "ALPHA_SOFT_TREND_BODY_RATIO", 0.25)
+    soft_vr = getattr(config, "ALPHA_SOFT_TREND_VOLUME_RATIO", 0.60)
 
-    # Controlled small candle exception near SMMA
-    if band_low is not None and band_high is not None:
-        if is_controlled_alpha_compression(
-            candle,
-            vr,
-            band_low,
-            band_high,
-            side=side,
-        ):
-            return True, "TREND_CONTROLLED_COMPRESSION", {
-                "body_ratio": round(br, 3),
-                "volume_ratio": round(vr, 3),
-                "distance_to_smma_pct": round(
-                    distance_to_band_pct(candle, band_low, band_high, side=side),
-                    3,
-                ),
-            }
+    if br < soft_br:
+        warnings.append("LOW_TREND_BODY_RATIO")
+    if bwr < 1.0:
+        warnings.append("MODERATE_WICK_TREND")
+    if vr < soft_vr:
+        warnings.append("LOW_TREND_VOLUME")
 
-    if br < getattr(config, "ALPHA_MIN_TREND_BODY_RATIO", 0.45):
-        return False, "TREND_BODY_RATIO", {
-            "body_ratio": round(br, 3),
-            "required": getattr(config, "ALPHA_MIN_TREND_BODY_RATIO", 0.45),
-        }
-
-    return False, "TREND_LOW_RELATIVE_VOLUME", {
+    return True, "TREND_QUALIFIED", {
+        "body_ratio": round(br, 3),
+        "body_to_wick_ratio": round(bwr, 3),
         "volume_ratio": round(vr, 3),
-        "required": getattr(config, "ALPHA_MIN_TREND_VOLUME_RATIO", 0.90),
+        "warnings": warnings,
     }
 
 
@@ -215,43 +196,85 @@ def alpha_high_volume_pullback_is_valid(
     band_high: float,
     trend_reference_volume: list,
     side="BUY",
-) -> bool:
+) -> tuple[bool, str]:
     volume_ratio = relative_volume(alpha, trend_reference_volume)
-
-    if volume_ratio <= getattr(config, "ALPHA_HIGH_VOLUME_PULLBACK_RATIO", 1.50):
-        return True
+    reversal_limit = getattr(config, "ALPHA_REVERSAL_VOLUME_RATIO", 2.50)
+    adverse_pos_max = getattr(config, "ALPHA_ADVERSE_CLOSE_POSITION_MAX", 0.30)
+    max_through = getattr(config, "ALPHA_MAX_CLOSE_THROUGH_BAND_PCT", 0.25) / 100.0
 
     if side == "BUY":
-        holds_band = float(alpha.low) <= band_high and float(alpha.close) >= band_low
+        holds_band = float(alpha.close) >= band_low * (1 - max_through)
         close_pos = close_position(alpha)
     else:
-        holds_band = float(alpha.high) >= band_low and float(alpha.close) <= band_high
+        holds_band = float(alpha.close) <= band_high * (1 + max_through)
         close_pos = bearish_close_position(alpha)
 
-    return (
-        getattr(config, "ALPHA_ALLOW_HIGH_VOLUME_PULLBACK_EXCEPTION", True)
-        and holds_band
-        and close_pos >= getattr(config, "ALPHA_PULLBACK_MIN_CLOSE_POSITION", 0.50)
-    )
+    if volume_ratio > reversal_limit:
+        if close_pos < adverse_pos_max or not holds_band:
+            return False, "ALPHA_DISTRIBUTION_REVERSAL"
+        return True, "HIGH_PULLBACK_VOLUME_SUPPORT_HOLD"
+
+    if not holds_band:
+        return False, "ALPHA_CLOSE_THROUGH_BAND"
+
+    return True, "ALPHA_PULLBACK_NORMAL"
 
 
 def valid_alpha_pullback_candle(candle, trend_volumes, band_low: float = None, band_high: float = None, side="BUY"):
     if side == "BUY" and not is_red(candle):
-        return False
+        return False, "ALPHA_NOT_RED", []
     if side == "SELL" and not is_green(candle):
-        return False
+        return False, "ALPHA_NOT_GREEN", []
 
-    b_ratio_valid = body_ratio(candle) >= config.ALPHA_MIN_ALPHA_BODY_RATIO
-    bw_ratio_valid = body_to_wick_ratio(candle) >= config.ALPHA_MIN_ALPHA_BODY_TO_WICK_RATIO
+    br = body_ratio(candle)
+    bwr = body_to_wick_ratio(candle)
     vol_ratio = relative_volume(candle, trend_volumes)
 
-    if b_ratio_valid and bw_ratio_valid and vol_ratio <= config.ALPHA_MAX_ALPHA_VOLUME_RATIO:
-        return True
+    if is_doji(candle):
+        return False, "ALPHA_DOJI", []
 
-    if band_low is not None and band_high is not None and b_ratio_valid:
-        return alpha_high_volume_pullback_is_valid(candle, band_low, band_high, trend_volumes, side=side)
+    hard_bwr = getattr(config, "ALPHA_MIN_ALPHA_BODY_TO_WICK_HARD", 0.75)
+    if bwr < hard_bwr:
+        return False, "ALPHA_WICK_DOMINANT", []
 
-    return False
+    warnings = []
+    if br < getattr(config, "ALPHA_SOFT_ALPHA_BODY_RATIO", 0.20):
+        warnings.append("LOW_ALPHA_BODY_RATIO")
+    if bwr < 1.0:
+        warnings.append("MODERATE_WICK_ALPHA")
+
+    b_low = band_low if band_low is not None else float(candle.low)
+    b_high = band_high if band_high is not None else float(candle.high)
+
+    is_valid, reason = alpha_high_volume_pullback_is_valid(candle, b_low, b_high, trend_volumes, side=side)
+    if not is_valid:
+        return False, reason, []
+
+    if reason == "HIGH_PULLBACK_VOLUME_SUPPORT_HOLD":
+        warnings.append("HIGH_PULLBACK_VOLUME")
+
+    return True, "ALPHA_PULLBACK_VALID", warnings
+
+
+def calculate_alpha_quality_score(candle, trend_run, warnings, side="BUY"):
+    score = 100
+    br = body_ratio(candle)
+    bwr = body_to_wick_ratio(candle)
+
+    if br < 0.25:
+        score -= 10
+    if br < 0.20:
+        score -= 10
+    if bwr < 1.0:
+        score -= 10
+    if "HIGH_PULLBACK_VOLUME" in warnings:
+        score -= 15
+    if "LOW_TREND_VOLUME" in warnings:
+        score -= 10
+    if "LOW_TREND_BODY_RATIO" in warnings:
+        score -= 10
+
+    return max(30, min(100, score))
 
 
 def entry_extension_pct(entry_price, trigger_level, side="BUY"):
@@ -292,10 +315,12 @@ def find_alpha_setup(pattern_candles, side="BUY"):
         b_low = min(float(alpha.smma_high), float(alpha.smma_close)) if pd.notna(alpha.smma_high) and pd.notna(alpha.smma_close) else float(alpha.low)
         b_high = max(float(alpha.smma_high), float(alpha.smma_close)) if pd.notna(alpha.smma_high) and pd.notna(alpha.smma_close) else float(alpha.high)
 
-        if not valid_alpha_pullback_candle(alpha, trend_volumes, band_low=b_low, band_high=b_high, side=side):
+        is_pullback_valid, p_reason, pullback_warnings = valid_alpha_pullback_candle(alpha, trend_volumes, band_low=b_low, band_high=b_high, side=side)
+        if not is_pullback_valid:
             continue
 
         reversed_run = []
+        trend_warnings = set()
         for index in range(alpha_idx - 1, -1, -1):
             candle = df.iloc[index]
             recent_volumes = df.iloc[max(0, index - 3):index]["volume"]
@@ -305,6 +330,9 @@ def find_alpha_setup(pattern_candles, side="BUY"):
             is_valid, reason, metrics = valid_alpha_trend_candle(candle, recent_volumes, band_low=cand_band_low, band_high=cand_band_high, side=side)
             if not is_valid:
                 break
+
+            if "warnings" in metrics:
+                trend_warnings.update(metrics["warnings"])
 
             if side == "BUY":
                 if reversed_run and float(reversed_run[-1].close) <= float(candle.high):
@@ -318,6 +346,9 @@ def find_alpha_setup(pattern_candles, side="BUY"):
         trend_run = list(reversed(reversed_run))
         if len(trend_run) < min_run:
             continue
+
+        all_warnings = list(sorted(set(pullback_warnings + list(trend_warnings))))
+        quality_score = calculate_alpha_quality_score(alpha, trend_run, all_warnings, side=side)
 
         # Found valid contiguous trend run followed immediately by pullback Alpha!
         # Now check confirmation in pattern bars formed after Alpha (up to ALPHA_CONFIRMATION_PATTERN_BARS)
@@ -344,7 +375,7 @@ def find_alpha_setup(pattern_candles, side="BUY"):
                 if breaks and closes:
                     ref_vols = [float(alpha.volume)] + [float(c.volume) for c in trend_run[-3:] if float(c.volume) > 0]
                     vol_r = relative_volume(c_bar, ref_vols)
-                    min_conf_vol = getattr(config, "ALPHA_CONFIRMATION_MIN_VOLUME_RATIO", 1.20)
+                    min_conf_vol = getattr(config, "ALPHA_CONFIRMATION_MIN_VOLUME_RATIO", 0.75)
                     if vol_r >= min_conf_vol:
                         confirmation_candle = c_bar
                         conf_vol_ratio = vol_r
@@ -395,6 +426,8 @@ def find_alpha_setup(pattern_candles, side="BUY"):
             "close_position_in_range": round(close_position(alpha) if side == "BUY" else bearish_close_position(alpha), 3),
             "band_low": b_low,
             "band_high": b_high,
+            "quality_score": quality_score,
+            "quality_warnings": all_warnings,
             "detected_at": datetime.now(config.TIME_ZONE),
         }
 

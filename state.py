@@ -29,6 +29,7 @@ _DEFAULT_STATE = {
     "universe_size": 0,
     "top_gainers": [],
     "top_losers": [],
+    "top_volume_leaders": [],
     "watchlist": {},          # legacy alpha watchlist compatibility
     "alpha_watchlist": {},    # security_id (str) -> Alpha setup dict
     "jp_watchlist": {},       # security_id (str) -> JP setup dict

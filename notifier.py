@@ -75,21 +75,43 @@ def notify_trend_forming(symbol, direction, candle_count, timeframe):
     send_telegram(message)
 
 
-def notify_alpha_candle_detected(symbol, direction, alpha_time, alpha_high, alpha_low, timeframe):
+def notify_alpha_candle_detected(symbol, direction, alpha_time, alpha_high, alpha_low, timeframe, quality_score=None, warnings=None):
     arrow = "📈" if direction == "BUY" else "📉"
     colour = "red" if direction == "BUY" else "green"
     level = alpha_high if direction == "BUY" else alpha_low
     level_label = "High" if direction == "BUY" else "Low"
+    
+    score_line = ""
+    if quality_score is not None:
+        warn_str = ", ".join(warnings) if warnings else "clean"
+        score_line = f"\nQuality: {quality_score}/100 | Notes: {warn_str}"
+
     send_telegram(
-        f"{arrow} <b>{symbol}</b> — Alpha Candle formed ({direction} setup)\n"
-        f"Time: {alpha_time} on {timeframe}-min chart ({colour} candle after the trend run)\n"
-        f"Watching for a completed 1-min candle wick to break Alpha "
-        f"{level_label} = ₹{level:.2f}\n"
-        f"Open your chart at exactly this candle to verify the setup."
+        f"{arrow} <b>{symbol}</b> — Alpha Candidate ({direction} watch)\n"
+        f"Time: {alpha_time} on {timeframe}-min chart ({colour} candle)\n"
+        f"Level ({level_label}): ₹{level:.2f}\n"
+        f"Awaiting 3m pattern confirmation before 1m trigger.{score_line}"
     )
 
 
-def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_price, band_low, band_high):
+def notify_alpha_candle_confirmed(symbol, direction, alpha_time, alpha_high, alpha_low, timeframe, quality_score=None, warnings=None):
+    arrow = "🟢" if direction == "BUY" else "🔴"
+    level = alpha_high if direction == "BUY" else alpha_low
+    level_label = "High" if direction == "BUY" else "Low"
+    
+    score_line = ""
+    if quality_score is not None:
+        warn_str = ", ".join(warnings) if warnings else "clean"
+        score_line = f"\nQuality: {quality_score}/100 | Notes: {warn_str}"
+
+    send_telegram(
+        f"{arrow} <b>{symbol}</b> — Alpha CONFIRMED ({direction})\n"
+        f"Pattern: {alpha_time} ({timeframe}-min)\n"
+        f"Watching for completed 1-min breakout close beyond {level_label}: ₹{level:.2f}{score_line}"
+    )
+
+
+def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_price, band_low, band_high, band_interaction="TOUCH", quality_score=None, warnings=None):
     arrow = "🟢" if direction == "BUY" else "🔴"
     level_name = "JP High" if direction == "BUY" else "JP Low"
     mode_line = (
@@ -97,18 +119,22 @@ def notify_jp_candle_detected(symbol, direction, jp_time, trigger_price, stop_pr
         if not config.JP_DETECTION_ONLY else
         "<i>Detection-only paper validation; no JP order will be placed.</i>"
     )
+    score_line = ""
+    if quality_score is not None:
+        warn_str = ", ".join(warnings) if warnings else "clean"
+        score_line = f"\nQuality: {quality_score}/100 | Band: {band_interaction} | Notes: {warn_str}"
+
     send_telegram(
-        f"{arrow} <b>{symbol}</b> — JP Pullback setup ({direction})\n"
-        f"JP pattern candle: {jp_time}\n"
+        f"{arrow} <b>{symbol}</b> — JP Candidate ({direction} - {band_interaction})\n"
+        f"Pattern candle: {jp_time}\n"
         f"SMMA band: ₹{band_low:.2f} – ₹{band_high:.2f}\n"
-        f"Waiting for the next 1-minute execution candle to cross {level_name}: ₹{trigger_price:.2f}\n"
-        f"Structural SL: ₹{stop_price:.2f}\n"
-        f"{mode_line}"
+        f"Trigger level ({level_name}): ₹{trigger_price:.2f} | SL: ₹{stop_price:.2f}\n"
+        f"{mode_line}{score_line}"
     )
 
 
 def notify_setup_expired(symbol, direction):
-    send_telegram(f"⏱ <b>{symbol}</b> — {direction} Alpha setup expired without breakout. Dropped from watch.")
+    send_telegram(f"⏱ <b>{symbol}</b> — {direction} setup expired without breakout. Dropped from watch.")
 
 
 def notify_entry(symbol, direction, qty, entry_price, sl_price, target_price, paper_mode,

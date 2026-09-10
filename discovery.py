@@ -241,9 +241,14 @@ def refresh_from_livefeed_full_universe(broker, universe_df, allow_stale_cache=F
     for rank, row in enumerate(losers, start=1):
         row["rank"] = rank
 
+    volume_leaders = sorted(rows, key=lambda row: float(row.get("volume", 0.0)), reverse=True)[:getattr(config, "TOP_N_VOLUME_LEADERS", 5)]
+    for rank, row in enumerate(volume_leaders, start=1):
+        row["rank"] = rank
+
     state.update({
         "top_gainers": gainers,
         "top_losers": losers,
+        "top_volume_leaders": volume_leaders,
         "livefeed_coverage": len(usable_records),
         "last_discovery_scan": now_tz.isoformat(),
     })

@@ -462,32 +462,63 @@ def heartbeat_loop():
 _last_scan_status_log_at = 0.0
 
 
-def build_scan_candidates():
-    global _last_scan_status_log_at
+def build_candidate_universe():
+    """
+    Builds a deduplicated candidate universe:
+    - Top 20 Gainers (Source: TOP_GAINER, direction: BUY)
+    - Top 20 Losers (Source: TOP_LOSER, direction: SELL)
+    - Top 5 Volume Leaders (Source: TOP_VOLUME, direction based on pct_change >= 0)
+    Returns list of deduplicated candidate dicts with priority tiers.
+    """
     snap = state.snapshot()
-    now = datetime.now(config.TIME_ZONE).time()
-    morning = datetime.strptime("09:20", "%H:%M").time() <= now <= datetime.strptime("10:30", "%H:%M").time()
-    limit = config.MORNING_MAX_CANDIDATES_PER_SIDE if morning else config.REGULAR_MAX_CANDIDATES_PER_SIDE
-    gainers = [{**item, "is_bullish_setup": True} for item in snap.get("top_gainers", [])[:limit]] if config.ALPHA_ALLOW_BUY else []
-    losers = [{**item, "is_bullish_setup": False} for item in snap.get("top_losers", [])[:limit]] if config.ALPHA_ALLOW_SELL else []
-    candidates = (gainers + losers) if config.ALPHA_ENABLED else []
-    now_ts = time.time()
-    if now_ts - _last_scan_status_log_at >= 60:
-        state.add_log(
-            f"Scan universe: LIVE, gainers={len(gainers)}, losers={len(losers)}, active={len(snap.get('watchlist', {})) + len(snap.get('open_positions', {}))}"
-        )
-        _last_scan_status_log_at = now_ts
-    return candidates
+    candidates = []
+
+    gainers = snap.get("top_gainers", [])[:config.TOP_N_GAINERS]
+    for row in gainers:
+        candidates.append({
+            **row,
+            "candidate_source": "TOP_GAINER",
+            "is_bullish_setup": True,
+            "priority_tier": 1 if row.get("rank", 99) <= 10 else 2,
+        })
+
+    losers = snap.get("top_losers", [])[:config.TOP_N_LOSERS]
+    for row in losers:
+        candidates.append({
+            **row,
+            "candidate_source": "TOP_LOSER",
+            "is_bullish_setup": False,
+            "priority_tier": 1 if row.get("rank", 99) <= 10 else 2,
+        })
+
+    if getattr(config, "INCLUDE_VOLUME_LEADER_POOL", True):
+        for row in snap.get("top_volume_leaders", [])[:getattr(config, "TOP_N_VOLUME_LEADERS", 5)]:
+            pct = float(row.get("pct_change", 0.0))
+            candidates.append({
+                **row,
+                "candidate_source": "TOP_VOLUME",
+                "is_bullish_setup": (pct >= 0),
+                "priority_tier": 2,
+            })
+
+    # Deduplicate by security ID, keeping higher priority if present in both
+    deduped = {}
+    for cand in candidates:
+        sid = str(cand["SECURITY_ID"])
+        if sid not in deduped:
+            deduped[sid] = cand
+        elif cand.get("priority_tier", 2) < deduped[sid].get("priority_tier", 2):
+            deduped[sid] = cand
+
+    return list(deduped.values())
+
+
+def build_scan_candidates():
+    return build_candidate_universe()
 
 
 def build_jp_scan_candidates():
-    snap = state.snapshot()
-    now = datetime.now(config.TIME_ZONE).time()
-    morning = datetime.strptime("09:20", "%H:%M").time() <= now <= datetime.strptime("10:30", "%H:%M").time()
-    limit = config.MORNING_MAX_CANDIDATES_PER_SIDE if morning else config.REGULAR_MAX_CANDIDATES_PER_SIDE
-    gainers = [{**row, "is_bullish_setup": True} for row in snap.get("top_gainers", [])[:limit] if config.JP_ALLOW_BUY]
-    losers = [{**row, "is_bullish_setup": False} for row in snap.get("top_losers", [])[:limit] if config.JP_ALLOW_SELL]
-    return gainers + losers
+    return build_candidate_universe()
 
 
 def scan_jp_candidate(broker, candidate, prev_trade_date):
@@ -536,7 +567,7 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
     # If countertrend, verify stricter confirmation volume threshold
     conf_vol_ratio = result.get("confirmation_volume_ratio", 1.0)
     if regime_mode == "COUNTERTREND":
-        min_counter_vol = getattr(config, "REGIME_COUNTERTREND_MIN_CONFIRMATION_VOLUME_RATIO", 1.50)
+        min_counter_vol = getattr(config, "REGIME_COUNTERTREND_MIN_CONFIRMATION_VOLUME_RATIO", 1.25)
         if conf_vol_ratio < min_counter_vol:
             return
 
@@ -574,6 +605,10 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
         "stop_distance_pct": round(stop_pct, 3), "detected_at": now.isoformat(),
         "expires_at": (result["jp_close_time"] + timedelta(minutes=config.JP_MAX_ENTRY_MINUTES)).isoformat(),
         "jp_key": key,
+        "candidate_source": candidate.get("candidate_source", "MOVER"),
+        "band_interaction": result.get("band_interaction", "BAND_TOUCH"),
+        "quality_score": result.get("quality_score", 100),
+        "quality_warnings": result.get("quality_warnings", []),
         "regime_mode": regime_mode,
         "regime_reason": regime_reason,
         "signal_quality": {
@@ -588,7 +623,7 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
     state.mark_jp_alerted(key)
     state.add_log(
         f"{symbol}: JP {result['direction']} detected at {result['jp_open_time'].isoformat()} "
-        f"trigger={result['trigger_price']:.2f} SL={result['stop_price']:.2f} [{regime_mode}]"
+        f"trigger={result['trigger_price']:.2f} SL={result['stop_price']:.2f} [{regime_mode}] Q={item['quality_score']}"
     )
     state.increment_jp_signal_count(security_id)
     if config.SEND_TELEGRAM_ON_JP_SETUP:
@@ -597,6 +632,9 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
             jp_time=result["jp_open_time"].isoformat(),
             trigger_price=result["trigger_price"], stop_price=result["stop_price"],
             band_low=result["band_low"], band_high=result["band_high"],
+            band_interaction=result.get("band_interaction", "TOUCH"),
+            quality_score=result.get("quality_score"),
+            warnings=result.get("quality_warnings"),
         )
 
 
@@ -735,16 +773,21 @@ def scan_candidate(broker, candidate, prev_trade_date):
             conf_vol = eval_res.get("confirmation_volume_ratio", 1.0)
             watchlist_entry.setdefault("signal_quality", {})["confirmation_volume_ratio"] = conf_vol
             state.set_watchlist_item(security_id, watchlist_entry)
-            dedup_key = watchlist_entry.get("alpha_key", str(security_id))
+            dedup_key = watchlist_entry.get("alpha_key", str(security_id)) + "_CONFIRMED"
             if not state.has_alerted(dedup_key):
                 if config.SEND_TELEGRAM_ON_SETUP_WATCH:
-                    notifier.notify_alpha_candle_detected(
-                        symbol, direction, watchlist_entry.get("alpha_candle_time", ""),
-                        float(watchlist_entry.get("alpha_high", 0.0)), float(watchlist_entry.get("alpha_low", 0.0)),
-                        config.PATTERN_TIMEFRAME
+                    notifier.notify_alpha_candle_confirmed(
+                        symbol=symbol,
+                        direction=direction,
+                        alpha_time=watchlist_entry.get("alpha_candle_time", ""),
+                        alpha_high=float(watchlist_entry.get("alpha_high", 0.0)),
+                        alpha_low=float(watchlist_entry.get("alpha_low", 0.0)),
+                        timeframe=config.PATTERN_TIMEFRAME,
+                        quality_score=watchlist_entry.get("quality_score"),
+                        warnings=watchlist_entry.get("quality_warnings"),
                     )
                 state.mark_alerted(dedup_key)
-                state.add_log(f"{symbol}: Alpha Candle confirmed & ready ({direction}) [{regime_mode}]")
+                state.add_log(f"{symbol}: Alpha Candle confirmed & ready ({direction}) [{regime_mode}] Q={watchlist_entry.get('quality_score')}")
             return
         elif eval_res.get("status") == "EXPIRED":
             state.remove_watchlist_item(security_id)
@@ -789,7 +832,7 @@ def scan_candidate(broker, candidate, prev_trade_date):
     conf_time = result.get("pattern_confirmation_time")
     conf_time_str = conf_time.isoformat() if conf_time is not None and hasattr(conf_time, "isoformat") else str(conf_time) if conf_time else None
 
-    state.set_watchlist_item(security_id, {
+    item = {
         "strategy": "ALPHA",
         "symbol": symbol,
         "security_id": str(security_id),
@@ -817,6 +860,9 @@ def scan_candidate(broker, candidate, prev_trade_date):
         "expires_at": (alpha_close_time + timedelta(minutes=config.ALPHA_MAX_ENTRY_MINUTES)).isoformat(),
         "pattern_confirmation_time": conf_time_str,
         "pattern_confirmation_status": result.get("pattern_confirmation_status"),
+        "quality_score": result.get("quality_score", 100),
+        "quality_warnings": result.get("quality_warnings", []),
+        "candidate_source": candidate.get("candidate_source", "MOVER"),
         "signal_quality": {
             "trend_volume_ratio": round(trend_volume_ratio, 3),
             "pullback_volume_ratio": round(result.get("pullback_volume_ratio", trend_volume_ratio), 3),
@@ -828,13 +874,40 @@ def scan_candidate(broker, candidate, prev_trade_date):
         "alpha_key": alpha_key,
         "regime_mode": regime_mode,
         "regime_reason": regime_reason,
-    })
-    if stage == "AWAITING_BREAKOUT" and not state.has_alerted(dedup_key):
+    }
+    state.set_watchlist_item(security_id, item)
+
+    if stage == "WAITING_3M_CONFIRMATION" and not state.has_alerted(dedup_key):
         if config.SEND_TELEGRAM_ON_SETUP_WATCH:
-            notifier.notify_alpha_candle_detected(symbol, direction, str(alpha.timestamp),
-                                                   float(alpha.high), float(alpha.low), config.PATTERN_TIMEFRAME)
+            notifier.notify_alpha_candle_detected(
+                symbol=symbol,
+                direction=direction,
+                alpha_time=str(alpha.timestamp),
+                alpha_high=float(alpha.high),
+                alpha_low=float(alpha.low),
+                timeframe=config.PATTERN_TIMEFRAME,
+                quality_score=item.get("quality_score"),
+                warnings=item.get("quality_warnings"),
+            )
         state.mark_alerted(dedup_key)
-        state.add_log(f"{symbol}: Alpha Candle confirmed & ready ({direction}) at {alpha.timestamp} [{regime_mode}]")
+        state.add_log(f"{symbol}: Alpha Candidate detected ({direction}) at {alpha.timestamp} [{regime_mode}] Q={item.get('quality_score')}")
+    elif stage == "AWAITING_BREAKOUT":
+        conf_dedup = dedup_key + "_CONFIRMED"
+        if not state.has_alerted(conf_dedup):
+            if config.SEND_TELEGRAM_ON_SETUP_WATCH:
+                notifier.notify_alpha_candle_confirmed(
+                    symbol=symbol,
+                    direction=direction,
+                    alpha_time=str(alpha.timestamp),
+                    alpha_high=float(alpha.high),
+                    alpha_low=float(alpha.low),
+                    timeframe=config.PATTERN_TIMEFRAME,
+                    quality_score=item.get("quality_score"),
+                    warnings=item.get("quality_warnings"),
+                )
+            state.mark_alerted(conf_dedup)
+            state.mark_alerted(dedup_key)
+            state.add_log(f"{symbol}: Alpha Candle confirmed & ready ({direction}) at {alpha.timestamp} [{regime_mode}] Q={item.get('quality_score')}")
     return
 
     if "alpha_close_time" not in watchlist_entry or "alpha_key" not in watchlist_entry:

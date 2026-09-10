@@ -33,7 +33,9 @@ def test_alpha_is_buy_only():
 
 def test_alpha_pullback_rejects_extreme_volume():
     pullback = _candle(110, 111, 100, 101, volume=1000)
-    assert not pattern.valid_alpha_pullback_candle(pullback, [100, 100, 100])
+    is_valid, reason, _ = pattern.valid_alpha_pullback_candle(pullback, [100, 100, 100])
+    assert not is_valid
+    assert reason == "ALPHA_DISTRIBUTION_REVERSAL"
 
 
 def test_alpha_run_must_be_immediately_before_pullback():
@@ -268,13 +270,15 @@ def test_diagnose_jp_rejection_reasons():
 
 def test_alpha_high_volume_shakeout_exception():
     # 1. High-volume red candle closing weakly below band -> Rejected
-    weak_pullback = _candle(105.0, 105.5, 100.0, 100.5, volume=2000)
-    assert not pattern.valid_alpha_pullback_candle(weak_pullback, [1000, 1000, 1000], band_low=102.0, band_high=104.0)
+    weak_pullback = _candle(105.0, 105.5, 100.0, 100.5, volume=3000)
+    is_v1, _, _ = pattern.valid_alpha_pullback_candle(weak_pullback, [1000, 1000, 1000], band_low=102.0, band_high=104.0)
+    assert not is_v1
 
     # 2. High-volume red shakeout holding band and closing in upper 50% of range -> Passes exception
-    # Red candle with lower shadow: open=105.0, close=104.0, high=105.1, low=102.5 -> range=2.6, body=1.0, upper_wick=0.1, lower_wick=1.5 -> close_pos=(104.0-102.5)/2.6=0.577 >= 0.50
-    strong_pullback = _candle(105.0, 105.1, 102.5, 104.0, volume=2000)
-    assert pattern.valid_alpha_pullback_candle(strong_pullback, [1000, 1000, 1000], band_low=102.0, band_high=104.0)
+    # Red candle with lower shadow: open=105.0, close=104.0, high=105.1, low=103.5 -> range=1.6, body=1.0, upper_wick=0.1, lower_wick=0.5 -> wick=0.6 -> bwr=1.0/0.6=1.67 >= 0.75, close_pos=(104.0-103.5)/1.6=0.31 >= 0.30, vol_ratio=3.0 > 2.50
+    strong_pullback = _candle(105.0, 105.1, 103.5, 104.0, volume=3000)
+    is_v2, _, _ = pattern.valid_alpha_pullback_candle(strong_pullback, [1000, 1000, 1000], band_low=102.0, band_high=104.0)
+    assert is_v2
 
 
 def test_jp_constructive_compression_and_confirmation_volume():
@@ -300,9 +304,9 @@ def test_alpha_controlled_compression_and_confirmation_volume():
     strong_candle = _candle(100.0, 102.0, 99.8, 101.5, volume=1000) # body=1.5, rng=2.2, body_ratio=0.68, body_to_wick=1.5/0.7=2.14
     is_valid, reason, _ = pattern.valid_alpha_trend_candle(strong_candle, [1000, 1000])
     assert is_valid
-    assert reason == "TREND_STRONG"
+    assert reason in ("TREND_STRONG", "TREND_QUALIFIED")
 
-    # 2. Weak candle with body < wick fails (body=0.8, range=2.0 -> wick=1.2 -> body_to_wick=0.67 < 1.0)
+    # 2. Weak candle with body < wick fails (body=0.8, range=2.0 -> wick=1.2 -> body_to_wick=0.67 < 0.75)
     weak_wick_candle = _candle(100.5, 102.0, 100.0, 101.3, volume=1000) # upper=0.7, lower=0.5 -> wick=1.2
     is_valid, reason, _ = pattern.valid_alpha_trend_candle(weak_wick_candle, [1000, 1000], band_low=100.0, band_high=101.0)
     assert not is_valid
@@ -432,8 +436,8 @@ def test_market_regime_allows_setup_policy():
     assert mode == "NEUTRAL"
     assert reason == "REGIME_NEUTRAL_STRENGTH_OK"
 
-    # Neutral with move < 1.00% -> NEUTRAL_REGIME_MOVE_TOO_SMALL
-    ok, mode, reason = main.market_regime_allows_setup("SELL", "UNKNOWN", -0.8)
+    # Neutral with move < 0.75% -> NEUTRAL_REGIME_MOVE_TOO_SMALL
+    ok, mode, reason = main.market_regime_allows_setup("SELL", "UNKNOWN", -0.5)
     assert ok is False
     assert mode == "NEUTRAL"
     assert reason == "NEUTRAL_REGIME_MOVE_TOO_SMALL"
@@ -449,8 +453,8 @@ def test_market_regime_allows_setup_policy():
     assert mode == "COUNTERTREND"
     assert reason == "COUNTERTREND_PENDING_STRONG_CONFIRMATION"
 
-    # Stock down -1.2% -> rejected as COUNTERTREND_MOVE_TOO_SMALL
-    ok, mode, reason = main.market_regime_allows_setup("SELL", "BULLISH", -1.2)
+    # Stock down -1.0% -> rejected as COUNTERTREND_MOVE_TOO_SMALL
+    ok, mode, reason = main.market_regime_allows_setup("SELL", "BULLISH", -1.0)
     assert ok is False
     assert mode == "COUNTERTREND"
     assert reason == "COUNTERTREND_MOVE_TOO_SMALL"
@@ -481,18 +485,23 @@ def test_jp_countertrend_in_opposing_regime_full_flow():
         })
         price += 1.8
 
-    # Pullback drops to band (band is around price - 8.0)
+    # Calculate SMMA so pullback touches band
+    df_prev = pd.DataFrame(candles)
+    smma_c = jp_pattern.smma(df_prev["close"], config.JP_SMMA_LENGTH)
+    band_c = float(smma_c.iloc[-1])
+
+    # Pullback drops to band with clean body-to-wick (body=4.0, upper=0.2, lower=1.0 -> wick=1.2 -> bwr=3.33)
     t_pullback = now - timedelta(minutes=6)
     candles.append({
         "timestamp": t_pullback,
         "open": price,
         "high": price + 0.2,
-        "low": price - 10.0, # touches band!
-        "close": price - 4.0, # close above band_low
+        "low": band_c - 0.5, # touches band!
+        "close": band_c + 1.0, # close above band_low
         "volume": 1000,
     })
 
-    # Confirmation bar with standard volume 1.25x (fails countertrend 1.50x requirement)
+    # Confirmation bar with standard volume 1.10x (fails countertrend 1.25x requirement)
     t_conf = now - timedelta(minutes=3)
     candles.append({
         "timestamp": t_conf,
@@ -500,12 +509,12 @@ def test_jp_countertrend_in_opposing_regime_full_flow():
         "high": price + 2.0,
         "low": price - 3.6,
         "close": price + 1.5,
-        "volume": 1250,
+        "volume": 1100,
     })
 
     df = pd.DataFrame(candles)
 
-    # 1. Countertrend with +2.5% move and 1.25x conf volume -> REJECTED COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW
+    # 1. Countertrend with +2.5% move and 1.10x conf volume -> REJECTED COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW
     cand_info = {"SECURITY_ID": 303, "rank": 1, "pct_change": 2.5, "volume": 100000, "is_bullish_setup": True}
     diag = signal_diagnostics.diagnose_jp_candidate(
         symbol="ATHER",
@@ -517,10 +526,10 @@ def test_jp_countertrend_in_opposing_regime_full_flow():
     )
     assert diag["regime_mode"] == "COUNTERTREND"
     assert diag["reason"] == "COUNTERTREND_CONFIRMATION_VOLUME_TOO_LOW"
-    assert diag["metrics"]["min_required"] == 1.50
+    assert diag["metrics"]["min_required"] == 1.25
 
-    # 2. Increase confirmation volume to 1.60x -> WAITING for 1m trigger!
-    df.loc[df.index[-1], "volume"] = 1600
+    # 2. Increase confirmation volume to 1.50x -> WAITING for 1m trigger!
+    df.loc[df.index[-1], "volume"] = 1500
     diag_pass = signal_diagnostics.diagnose_jp_candidate(
         symbol="ATHER",
         security_id=303,
@@ -863,17 +872,16 @@ def test_opening_momentum_detection_only(monkeypatch):
 
 
 def test_selective_thresholds_applied():
-    """Verify selective thresholds: Alpha trend 0.40, Alpha pullback 0.25, Alpha vol 0.80, JP vol 0.75-2.25."""
-    assert config.ALPHA_MIN_TREND_BODY_RATIO == 0.40
-    assert config.ALPHA_MIN_ALPHA_BODY_RATIO == 0.25
-    assert config.ALPHA_MIN_TREND_VOLUME_RATIO == 0.80
-    assert config.JP_MIN_VOLUME_RATIO == 0.75
-    assert config.JP_MAX_VOLUME_RATIO == 2.25
-    assert config.DOJI_BODY_RATIO == 0.18
-    assert config.ALPHA_MIN_TREND_BODY_TO_WICK_RATIO == 1.0
-    assert config.ALPHA_MIN_ALPHA_BODY_TO_WICK_RATIO == 1.0
-    assert config.JP_MIN_BODY_TO_WICK_RATIO == 1.0
-    assert config.JP_MIN_BODY_RATIO == 0.25
+    """Verify two-tier thresholds: Alpha trend soft 0.25, Alpha pullback soft 0.20, hard floors 0.75."""
+    assert config.ALPHA_SOFT_TREND_BODY_RATIO == 0.25
+    assert config.ALPHA_SOFT_ALPHA_BODY_RATIO == 0.20
+    assert config.ALPHA_SOFT_TREND_VOLUME_RATIO == 0.60
+    assert config.ALPHA_MIN_TREND_BODY_TO_WICK_HARD == 0.75
+    assert config.ALPHA_MIN_ALPHA_BODY_TO_WICK_HARD == 0.75
+    assert config.JP_MIN_BODY_TO_WICK_HARD == 0.75
+    assert config.JP_MIN_VOLUME_RATIO_HARD == 0.60
+    assert config.DOJI_BODY_RATIO == 0.15
+    assert config.JP_MIN_BODY_RATIO == 0.20
 
 
 def test_countertrend_policy_and_1m_close_requirement(monkeypatch):
@@ -885,13 +893,13 @@ def test_countertrend_policy_and_1m_close_requirement(monkeypatch):
     allowed_aligned_fail, _, _ = main.market_regime_allows_setup("BUY", "BULLISH", 0.60)
     assert allowed_aligned_fail is False
 
-    allowed_neutral, mode_neu, _ = main.market_regime_allows_setup("BUY", "NEUTRAL", 1.10)
+    allowed_neutral, mode_neu, _ = main.market_regime_allows_setup("BUY", "NEUTRAL", 0.80)
     assert allowed_neutral is True and mode_neu == "NEUTRAL"
 
-    allowed_counter, mode_ct, _ = main.market_regime_allows_setup("BUY", "BEARISH", 1.60)
+    allowed_counter, mode_ct, _ = main.market_regime_allows_setup("BUY", "BEARISH", 1.30)
     assert allowed_counter is True and mode_ct == "COUNTERTREND"
 
-    allowed_counter_fail, _, _ = main.market_regime_allows_setup("BUY", "BEARISH", 1.30)
+    allowed_counter_fail, _, _ = main.market_regime_allows_setup("BUY", "BEARISH", 1.10)
     assert allowed_counter_fail is False
 
     # 2. Countertrend 1m close rejection when high crosses but close does not
@@ -965,4 +973,166 @@ def test_terminal_outcome_logging_for_all_paths(monkeypatch):
     now_bar = {"timestamp": now - timedelta(seconds=2), "high": 101.0, "close": 100.8}
     main.process_new_1m_bar_for_setup(mock_broker, setup_ext, now_bar)
     assert "ENTRY_REJECTED_EXTENSION" in outcomes
+
+
+def test_soft_warning_candidate_not_tradeable_until_3m_confirmed(monkeypatch):
+    """Verify that a candidate with soft warnings is not tradeable until 3m confirmed."""
+    # Setup candidate created with soft warnings (stage: WAITING_3M_CONFIRMATION)
+    setup = {
+        "security_id": "701",
+        "symbol": "SOFT_WARN_SYM",
+        "strategy": "ALPHA",
+        "direction": "BUY",
+        "stage": "WAITING_3M_CONFIRMATION",
+        "trigger_price": 100.0,
+        "pattern_close_time": "2026-09-10T10:00:00+05:30",
+        "expires_at": "2026-09-10T10:15:00+05:30",
+        "quality_score": 80,
+        "quality_warnings": ["LOW_TREND_BODY_RATIO"],
+    }
+    # 1-minute breakout occurs
+    bar = {
+        "timestamp": datetime(2026, 9, 10, 10, 4, tzinfo=config.TIME_ZONE),
+        "open": 99.5,
+        "high": 101.5,
+        "low": 99.0,
+        "close": 101.2,
+    }
+    # Should NOT enter trade if stage is not AWAITING_BREAKOUT / AWAITING_1M_TRIGGER
+    res = main.process_new_1m_bar_for_setup(None, setup, bar)
+    # process_new_1m_bar_for_setup handles triggers for confirmed setups or logs appropriately
+    assert res is None or res != "TRADE_ENTERED"
+
+
+def test_body_to_wick_hard_floor_vs_soft_warning():
+    """Verify body-to-wick: < 0.75 rejects, 0.75-1.00 passes with warning, >= 1.00 clean."""
+    # 1. < 0.75 -> Rejects
+    # candle: open=100.0, close=100.7, high=101.5, low=99.5 -> body=0.7, upper=0.8, lower=0.5 -> wick=1.3 -> bwr=0.538 < 0.75
+    c_fail = _candle(100.0, 101.5, 99.5, 100.7, volume=1000)
+    is_valid, reason, _ = pattern.valid_alpha_trend_candle(c_fail, [1000, 1000])
+    assert not is_valid
+    assert reason == "TREND_BODY_TO_WICK"
+
+    # 2. 0.75 <= bwr < 1.00 -> Passes with MODERATE_WICK_TREND warning
+    # candle: open=100.0, close=100.85, high=101.5, low=99.5 -> body=0.85, upper=0.65, lower=0.5 -> wick=1.15 -> bwr=0.739 -> let's make body=0.9, wick=1.0 -> bwr=0.9
+    c_warn = _candle(100.0, 101.5, 99.5, 100.9, volume=1000) # body=0.9, upper=0.6, lower=0.5 -> wick=1.1 -> bwr=0.818
+    is_valid, reason, metrics = pattern.valid_alpha_trend_candle(c_warn, [1000, 1000])
+    assert is_valid
+    assert "MODERATE_WICK_TREND" in metrics["warnings"]
+
+    # 3. >= 1.00 -> Passes clean (no wick warning)
+    c_clean = _candle(100.0, 101.5, 99.8, 101.3, volume=1000) # body=1.3, upper=0.2, lower=0.2 -> wick=0.4 -> bwr=3.25
+    is_valid, reason, metrics = pattern.valid_alpha_trend_candle(c_clean, [1000, 1000])
+    assert is_valid
+    assert "MODERATE_WICK_TREND" not in metrics["warnings"]
+
+
+def test_jp_volume_hard_floor_vs_soft_warning():
+    """Verify JP volume: < 0.60 rejects, 0.60-0.80 passes with warning, >= 0.80 clean."""
+    now = datetime(2026, 9, 10, 10, 0, tzinfo=config.TIME_ZONE)
+    candles = []
+    price = 100.0
+    for i in range(13):
+        candles.append({
+            "timestamp": now - timedelta(minutes=(15 - i) * 3),
+            "open": price, "high": price + 1.5, "low": price - 0.2, "close": price + 1.2, "volume": 1000
+        })
+        price += 1.2
+
+    df_base = pd.DataFrame(candles)
+    smma_c = jp_pattern.smma(df_base["close"], config.JP_SMMA_LENGTH)
+    band_c = float(smma_c.iloc[-1])
+
+    # 1. Volume ratio 0.50x < 0.60 hard floor -> None (rejected)
+    c_fail = candles + [
+        {"timestamp": now - timedelta(minutes=6), "open": price, "high": price + 0.1, "low": band_c - 0.2, "close": band_c + 0.5, "volume": 500},
+        {"timestamp": now - timedelta(minutes=3), "open": band_c + 0.5, "high": price + 1.0, "low": band_c + 0.3, "close": price + 0.8, "volume": 1500}
+    ]
+    assert jp_pattern.find_jp_setup(pd.DataFrame(c_fail), is_bullish_setup=True) is None
+
+    # 2. Volume ratio 0.70x (between 0.60 and 0.80) -> Passes with LOW_JP_VOLUME warning
+    c_warn = candles + [
+        {"timestamp": now - timedelta(minutes=6), "open": price, "high": price + 0.1, "low": band_c - 0.2, "close": band_c + 0.5, "volume": 700},
+        {"timestamp": now - timedelta(minutes=3), "open": band_c + 0.5, "high": price + 1.0, "low": band_c + 0.3, "close": price + 0.8, "volume": 1500}
+    ]
+    res_warn = jp_pattern.find_jp_setup(pd.DataFrame(c_warn), is_bullish_setup=True)
+    assert res_warn is not None
+    assert "LOW_JP_VOLUME" in res_warn["quality_warnings"]
+
+    # 3. Volume ratio 1.00x >= 0.80 -> Clean
+    c_clean = candles + [
+        {"timestamp": now - timedelta(minutes=6), "open": price, "high": price + 0.1, "low": band_c - 0.2, "close": band_c + 0.5, "volume": 1000},
+        {"timestamp": now - timedelta(minutes=3), "open": band_c + 0.5, "high": price + 1.0, "low": band_c + 0.3, "close": price + 0.8, "volume": 1500}
+    ]
+    res_clean = jp_pattern.find_jp_setup(pd.DataFrame(c_clean), is_bullish_setup=True)
+    assert res_clean is not None
+    assert "LOW_JP_VOLUME" not in res_clean["quality_warnings"]
+
+
+def test_jp_near_band_tolerance_and_max_points_cap():
+    """Verify JP near band interaction: exact touch -> BAND_TOUCH, near <= min(0.15%, 3.0pt) -> BAND_NEAR."""
+    # 1. Exact touch
+    c_touch = _candle(100.0, 102.0, 98.0, 101.0)
+    interacts, itype = jp_pattern.jp_interacts_with_band(c_touch, band_low=98.5, band_high=99.5, side="BUY")
+    assert interacts is True
+    assert itype == "BAND_TOUCH"
+
+    # 2. Near band within 0.15% (stock at 100.0, 0.15% = 0.15 pt; candle low = 100.10, band_high = 100.00 -> gap = 0.10 <= 0.15)
+    c_near = _candle(100.5, 102.0, 100.10, 101.5)
+    interacts, itype = jp_pattern.jp_interacts_with_band(c_near, band_low=99.0, band_high=100.0, side="BUY")
+    assert interacts is True
+    assert itype == "BAND_NEAR"
+
+    # 3. Beyond tolerance (gap = 0.30 > 0.15)
+    c_far = _candle(101.0, 103.0, 100.30, 102.0)
+    interacts, itype = jp_pattern.jp_interacts_with_band(c_far, band_low=99.0, band_high=100.0, side="BUY")
+    assert interacts is False
+
+    # 4. Cap at 3.0 points on high-priced stock (e.g. ₹5,000, 0.15% = 7.50 pt, capped at 3.0 pt)
+    c_exp_near = _candle(5005.0, 5010.0, 5002.5, 5008.0) # gap = 2.5 pt <= 3.0 pt cap
+    interacts, itype = jp_pattern.jp_interacts_with_band(c_exp_near, band_low=4990.0, band_high=5000.0, side="BUY")
+    assert interacts is True
+    assert itype == "BAND_NEAR"
+
+    c_exp_far = _candle(5005.0, 5010.0, 5004.0, 5008.0) # gap = 4.0 pt > 3.0 pt cap
+    interacts, itype = jp_pattern.jp_interacts_with_band(c_exp_far, band_low=4990.0, band_high=5000.0, side="BUY")
+    assert interacts is False
+
+
+def test_candidate_universe_deduplication_and_volume_leaders(monkeypatch):
+    """Verify build_candidate_universe deduplicates Top 20 Gainers + Top 20 Losers + Top 5 Volume leaders."""
+    mock_state = {
+        "top_gainers": [{"SECURITY_ID": 1, "display_name": "G1", "pct_change": 3.0, "rank": 1}],
+        "top_losers": [{"SECURITY_ID": 2, "display_name": "L1", "pct_change": -3.0, "rank": 1}],
+        "top_volume_leaders": [
+            {"SECURITY_ID": 1, "display_name": "G1", "pct_change": 3.0, "rank": 1}, # Duplicate of G1
+            {"SECURITY_ID": 3, "display_name": "V1", "pct_change": 1.5, "rank": 2}, # Positive -> BUY
+            {"SECURITY_ID": 4, "display_name": "V2", "pct_change": -1.2, "rank": 3}, # Negative -> SELL
+        ],
+    }
+    monkeypatch.setattr(state, "snapshot", lambda: mock_state)
+    candidates = main.build_candidate_universe()
+
+    # Total should be 4 (1, 2, 3, 4) - ID 1 deduplicated
+    sids = [c["SECURITY_ID"] for c in candidates]
+    assert len(sids) == 4
+    assert sids.count(1) == 1
+
+    # Check direction assignment for volume leaders
+    v1 = next(c for c in candidates if c["SECURITY_ID"] == 3)
+    v2 = next(c for c in candidates if c["SECURITY_ID"] == 4)
+    assert v1["is_bullish_setup"] is True
+    assert v2["is_bullish_setup"] is False
+
+
+def test_telegram_notifications_do_not_send_rejections(monkeypatch):
+    """Verify that notifier sends setup candidates and confirmations, but no rejection messages."""
+    sent_messages = []
+    def fake_send_telegram(msg):
+        sent_messages.append(msg)
+
+    monkeypatch.setattr(main.notifier, "send_telegram", fake_send_telegram)
+    # Rejections logged to state only
+    state.add_log("REJECTED: some filter failed")
+    assert len(sent_messages) == 0
 

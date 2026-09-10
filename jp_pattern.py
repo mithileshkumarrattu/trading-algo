@@ -32,6 +32,34 @@ def smma(series: pd.Series, length: int) -> pd.Series:
     return result
 
 
+def jp_interacts_with_band(candle, band_low: float, band_high: float, side: str = "BUY") -> tuple[bool, str]:
+    """
+    Check if candle touches or is within price-scaled near-band tolerance.
+    Tolerance = min(band_ref * 0.15%, 3.0 points).
+    """
+    band_ref = float(band_high) if side == "BUY" else float(band_low)
+    pct_tol = getattr(config, "JP_BAND_NEAR_TOLERANCE_PCT", 0.15) / 100.0
+    max_pts = getattr(config, "JP_BAND_NEAR_TOLERANCE_MAX_POINTS", 3.0)
+    tolerance = min(band_ref * pct_tol, max_pts)
+
+    candle_low = float(candle.low)
+    candle_high = float(candle.high)
+
+    # Exact touch
+    if candle_low <= band_high and candle_high >= band_low:
+        return True, "BAND_TOUCH"
+
+    # Near band interaction
+    if side == "BUY":
+        if candle_low <= band_high + tolerance and candle_high >= band_low - tolerance:
+            return True, "BAND_NEAR"
+    else:
+        if candle_high >= band_low - tolerance and candle_low <= band_high + tolerance:
+            return True, "BAND_NEAR"
+
+    return False, "NO_BAND_INTERACTION"
+
+
 def _touches_band(candle, band_low: float, band_high: float) -> bool:
     candle_low = float(candle.low)
     candle_high = float(candle.high)
@@ -52,6 +80,14 @@ def close_below_band(candle, band_low):
 
 def candle_range(candle):
     return max(0.0, float(candle.high) - float(candle.low))
+
+
+def body_to_wick_ratio(candle) -> float:
+    body = abs(float(candle.close) - float(candle.open))
+    upper = float(candle.high) - max(float(candle.open), float(candle.close))
+    lower = min(float(candle.open), float(candle.close)) - float(candle.low)
+    wick = max(0.0, upper) + max(0.0, lower)
+    return body / wick if wick > 0 else float("inf")
 
 
 def constructive_compression(
@@ -159,40 +195,68 @@ def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool, session
                      max(float(row.jp_smma_high), float(row.jp_smma_close)))
         for _, row in prior.iterrows()
     )
+
+    warnings = []
     compression_valid = False
-    if prior_touch_count > config.JP_MAX_PRIOR_BAND_TOUCHES:
+    max_touches = getattr(config, "JP_MAX_PRIOR_BAND_TOUCHES_SOFT", 3)
+    if prior_touch_count > max_touches:
         if getattr(config, "JP_ALLOW_CONSTRUCTIVE_COMPRESSION", True) and constructive_compression(
             prior, band_low, band_high, bullish=is_bullish_setup
         ):
             compression_valid = True
+            warnings.append("CONSTRUCTIVE_COMPRESSION")
         else:
             return None
+    elif prior_touch_count >= 2:
+        warnings.append("MODERATE_PRIOR_BAND_TOUCHES")
+
     if is_bullish_setup:
         trend_side_count = sum(close_above_band(row, max(float(row.jp_smma_high), float(row.jp_smma_close))) for _, row in prior.iterrows())
     else:
         trend_side_count = sum(close_below_band(row, min(float(row.jp_smma_high), float(row.jp_smma_close))) for _, row in prior.iterrows())
-    if trend_side_count < config.JP_MIN_PRIOR_BARS_TREND_SIDE:
-        return None
-    if not touches_band(candle, band_low, band_high) or _body_ratio(candle) < config.JP_MIN_BODY_RATIO:
+    if trend_side_count < getattr(config, "JP_MIN_PRIOR_TREND_SIDE_BARS_SOFT", 1):
         return None
 
-    # Hard safety check on wicks
+    side = "BUY" if is_bullish_setup else "SELL"
+    interacts, interaction_type = jp_interacts_with_band(candle, band_low, band_high, side=side)
+    if not interacts:
+        return None
+    if interaction_type == "BAND_NEAR":
+        warnings.append("BAND_NEAR")
+
+    b_ratio = _body_ratio(candle)
+    if b_ratio < getattr(config, "JP_HARD_DOJI_BODY_RATIO", 0.15):
+        return None
+    if b_ratio < getattr(config, "JP_MIN_BODY_RATIO", 0.20):
+        warnings.append("LOW_JP_BODY_RATIO")
+
+    # Hard safety check on wicks (0.75 hard floor)
     rng = candle_range(candle)
     body = abs(float(candle.close) - float(candle.open))
     upper = float(candle.high) - max(float(candle.open), float(candle.close))
     lower = min(float(candle.open), float(candle.close)) - float(candle.low)
     wick = max(0.0, upper) + max(0.0, lower)
     b_to_w = body / wick if wick > 0 else float("inf")
-    if b_to_w < getattr(config, "JP_MIN_BODY_TO_WICK_RATIO", 1.0):
+    hard_b_to_w = getattr(config, "JP_MIN_BODY_TO_WICK_HARD", 0.75)
+    if b_to_w < hard_b_to_w:
         return None
+    if b_to_w < 1.0:
+        warnings.append("MODERATE_WICK_JP")
 
     reference_volume = float(prior["volume"].median()) if not prior.empty else 0.0
     volume_ratio = float(candle.volume) / reference_volume if reference_volume > 0 else 1.0
-    if not config.JP_MIN_VOLUME_RATIO <= volume_ratio <= config.JP_MAX_VOLUME_RATIO:
+    min_vol_hard = getattr(config, "JP_MIN_VOLUME_RATIO_HARD", 0.60)
+    reversal_vol_max = getattr(config, "JP_REVERSAL_VOLUME_RATIO", 3.00)
+
+    if volume_ratio < min_vol_hard:
+        return None
+    if volume_ratio < 0.80:
+        warnings.append("LOW_JP_VOLUME")
+    if volume_ratio > reversal_vol_max:
         return None
 
     close = float(candle.close)
-    max_through = config.JP_MAX_CLOSE_THROUGH_BAND_PCT / 100.0
+    max_through = getattr(config, "JP_MAX_CLOSE_THROUGH_BAND_PCT", 0.25) / 100.0
     if is_bullish_setup:
         if not _is_uptrend(df, jp_index) or close < band_low * (1 - max_through):
             return None
@@ -221,11 +285,25 @@ def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool, session
         conf_vol = float(confirmation.volume)
         conf_ref = float(prior["volume"].median()) if not prior.empty and float(prior["volume"].median()) > 0 else float(candle.volume)
         conf_vol_ratio = conf_vol / conf_ref if conf_ref > 0 else 1.0
-        min_conf_vol = getattr(config, "JP_CONFIRMATION_MIN_VOLUME_RATIO", 1.20)
+        min_conf_vol = getattr(config, "JP_CONFIRMATION_MIN_VOLUME_RATIO", 0.75)
         if conf_vol_ratio < min_conf_vol:
             return None
     else:
         conf_vol_ratio = 1.0
+
+    # Calculate quality score (0-100)
+    quality_score = 100
+    if interaction_type == "BAND_NEAR":
+        quality_score -= 10
+    if "LOW_JP_VOLUME" in warnings:
+        quality_score -= 10
+    if "LOW_JP_BODY_RATIO" in warnings:
+        quality_score -= 10
+    if "MODERATE_WICK_JP" in warnings:
+        quality_score -= 10
+    if "MODERATE_PRIOR_BAND_TOUCHES" in warnings:
+        quality_score -= 10
+    quality_score = max(30, min(100, quality_score))
 
     return {
         "strategy": "JP",
@@ -245,12 +323,15 @@ def find_jp_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool, session
         "trigger_price": trigger_price,
         "stop_price": stop_price,
         "structural_stop_price": stop_price,
-        "body_ratio": _body_ratio(candle),
-        "volume_ratio": volume_ratio,
+        "body_ratio": round(_body_ratio(candle), 3),
+        "volume_ratio": round(volume_ratio, 3),
         "prior_band_touch_count": prior_touch_count,
         "compression_valid": compression_valid,
         "confirmation_volume_ratio": round(conf_vol_ratio, 3),
         "trend_side_count": trend_side_count,
+        "band_interaction": interaction_type,
+        "quality_score": quality_score,
+        "quality_warnings": warnings,
         "pattern_confirmation_time": confirmation.timestamp,
         "pattern_confirmation_status": "CONFIRMED",
         "detected_at": datetime.now(config.TIME_ZONE),
