@@ -212,14 +212,18 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
             return None
 
     expires_at = setup.get("expires_at")
-    if expires_at and bar_time > datetime.fromisoformat(expires_at):
-        strategy_name = strategy
-        state.log_setup_outcome(setup, "SETUP_EXPIRED", f"expired_at={expires_at}")
-        if strategy_name == "JP":
-            state.remove_jp_setup(security_id)
-        else:
-            state.remove_alpha_setup(security_id)
-        return "SETUP_EXPIRED"
+    if expires_at:
+        exp_dt = datetime.fromisoformat(expires_at)
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=config.TIME_ZONE)
+        if bar_time > exp_dt:
+            strategy_name = strategy
+            state.log_setup_outcome(setup, "SETUP_EXPIRED", f"expired_at={expires_at}")
+            if strategy_name == "JP":
+                state.remove_jp_setup(security_id)
+            else:
+                state.remove_alpha_setup(security_id)
+            return "SETUP_EXPIRED"
 
     high = float(latest_completed_1m_bar.get("high", 0.0))
     low = float(latest_completed_1m_bar.get("low", 0.0))
@@ -245,8 +249,29 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         state.remove_jp_setup(security_id)
         return "JP_TRIGGER_DETECTED_ONLY"
 
+    if strategy == "OPENING_MOMENTUM" and getattr(config, "OPENING_MOMENTUM_DETECTION_ONLY", True):
+        if crossed:
+            state.log_setup_outcome(setup, "OPENING_MOMENTUM_TRIGGER_DETECTED_ONLY", f"trigger={trigger_level:.2f}, 1m_high={high:.2f}, 1m_close={close:.2f}")
+            state.remove_alpha_setup(security_id)
+            state.add_log(f"{symbol}: OPENING_MOMENTUM trigger detected only at {bar_time_iso} (no order placed)")
+            return "OPENING_MOMENTUM_TRIGGER_DETECTED_ONLY"
+        return None
+
     if not crossed:
         return None
+
+    # Check countertrend 1m close requirement if enabled
+    regime_mode = setup.get("regime_mode")
+    if regime_mode == "COUNTERTREND" and getattr(config, "REGIME_COUNTERTREND_REQUIRE_1M_CLOSE_CONFIRMATION", True):
+        close_confirmed = (close > trigger_level) if direction == "BUY" else (close < trigger_level)
+        if not close_confirmed:
+            state.log_setup_outcome(setup, "COUNTERTREND_1M_CLOSE_NOT_CONFIRMED", f"close={close:.2f}, trigger={trigger_level:.2f}")
+            state.add_log(f"{symbol}: Entry rejected - countertrend 1m close {close:.2f} did not confirm beyond trigger {trigger_level:.2f}")
+            if strategy == "JP":
+                state.remove_jp_setup(security_id)
+            else:
+                state.remove_alpha_setup(security_id)
+            return "COUNTERTREND_1M_CLOSE_NOT_CONFIRMED"
 
     now = datetime.now(config.TIME_ZONE)
     bar_close_at = bar_time + timedelta(minutes=1)
@@ -284,7 +309,6 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
         return "ENTRY_REJECTED_EXTENSION"
 
     # For countertrend setups, verify confirmation volume meets minimum threshold
-    regime_mode = setup.get("regime_mode")
     signal_quality = setup.get("signal_quality", {})
     conf_vol = signal_quality.get("confirmation_volume_ratio", 1.0)
     if regime_mode == "COUNTERTREND":
@@ -574,6 +598,84 @@ def scan_jp_candidate(broker, candidate, prev_trade_date):
             trigger_price=result["trigger_price"], stop_price=result["stop_price"],
             band_low=result["band_low"], band_high=result["band_high"],
         )
+
+
+def scan_opening_momentum_candidate(broker, candidate, prev_trade_date):
+    if not getattr(config, "OPENING_MOMENTUM_ENABLED", True):
+        return
+
+    now_time = datetime.now(config.TIME_ZONE).time()
+    start_time = datetime.strptime(getattr(config, "OPENING_MOMENTUM_START_TIME", "09:18"), "%H:%M").time()
+    end_time = datetime.strptime(getattr(config, "OPENING_MOMENTUM_END_TIME", "09:45"), "%H:%M").time()
+    if not (start_time <= now_time <= end_time):
+        return
+
+    security_id = int(candidate["SECURITY_ID"])
+    symbol = candidate["display_name"]
+    is_bullish_setup = candidate["is_bullish_setup"]
+    direction = "BUY" if is_bullish_setup else "SELL"
+    regime = state.snapshot().get("market_regime")
+    pct_change = candidate.get("pct_change", 0.0)
+
+    regime_mode = "ALIGNED"
+    regime_reason = "REGIME_ALIGNED"
+    if getattr(config, "ALPHA_USE_MARKET_REGIME_FILTER", True):
+        allowed, regime_mode, regime_reason = market_regime_allows_setup(
+            direction=direction,
+            market_regime=regime,
+            pct_change=pct_change,
+        )
+        if not allowed:
+            return
+
+    snap = state.snapshot()
+    if str(security_id) in snap.get("open_positions", {}) or str(security_id) in snap.get("watchlist", {}):
+        return
+
+    try:
+        pattern_candles = get_cached_pattern_candles(broker, security_id, prev_trade_date, config.PATTERN_TIMEFRAME)
+    except Exception:
+        return
+
+    if pattern_candles is None or pattern_candles.empty:
+        return
+
+    today = datetime.now(config.TIME_ZONE).date()
+    res = pattern.find_opening_momentum_setup(pattern_candles, is_bullish_setup=is_bullish_setup, session_date=today)
+    if res is None:
+        return
+
+    key = f"OPENING_MOMENTUM_{security_id}_{direction}_{res['pattern_open_time'].isoformat()}"
+    if state.has_alerted(key):
+        return
+
+    now = datetime.now(config.TIME_ZONE)
+    item = {
+        "strategy": "OPENING_MOMENTUM",
+        "symbol": symbol,
+        "security_id": str(security_id),
+        "direction": direction,
+        "stage": "AWAITING_1M_TRIGGER",
+        "pattern_timeframe": config.PATTERN_TIMEFRAME,
+        "pattern_open_time": res["pattern_open_time"].isoformat(),
+        "pattern_close_time": res["pattern_close_time"].isoformat(),
+        "pattern_high": res["pattern_high"],
+        "pattern_low": res["pattern_low"],
+        "trigger_price": res["trigger_price"],
+        "stop_price": res["stop_price"],
+        "detected_at": now.isoformat(),
+        "expires_at": (res["pattern_close_time"] + timedelta(minutes=int(getattr(config, "OPENING_MOMENTUM_HOLD_MINUTES", 15)))).isoformat(),
+        "alpha_key": key,
+        "regime_mode": regime_mode,
+        "regime_reason": regime_reason,
+        "signal_quality": {
+            "body_ratio": res.get("body_ratio", 0.0),
+            "body_to_wick_ratio": res.get("body_to_wick_ratio", 0.0),
+        },
+    }
+    state.set_alpha_watchlist_item(security_id, item)
+    state.mark_alerted(key)
+    state.add_log(f"{symbol}: OPENING_MOMENTUM {direction} setup detected at {res['pattern_open_time'].isoformat()} trigger={res['trigger_price']:.2f}")
 
 
 def scan_candidate(broker, candidate, prev_trade_date):
@@ -910,6 +1012,8 @@ def scan_loop(broker, prev_trade_date):
                 candidates = build_scan_candidates()
                 for cand in candidates:
                     scan_candidate(broker, cand, prev_trade_date)
+                    if getattr(config, "OPENING_MOMENTUM_ENABLED", True):
+                        scan_opening_momentum_candidate(broker, cand, prev_trade_date)
                     time.sleep(0.2)
                 for cand in build_jp_scan_candidates():
                     scan_jp_candidate(broker, cand, prev_trade_date)

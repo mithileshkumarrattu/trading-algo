@@ -659,6 +659,96 @@ def diagnose_jp_candidate(
     return diag_base
 
 
+def diagnose_opening_momentum_candidate(
+    symbol: str,
+    security_id: int,
+    candidate_info: dict,
+    today_pattern_candles: Optional[pd.DataFrame],
+    regime: str,
+    now: datetime,
+    session_date=None,
+) -> dict:
+    """
+    Evaluates Opening Momentum setup rules and returns structured diagnostic dict.
+    """
+    rank = candidate_info.get("rank")
+    pct_change = candidate_info.get("pct_change", 0.0)
+    volume = candidate_info.get("volume", 0.0)
+    is_bullish_setup = candidate_info.get("is_bullish_setup", True)
+    side = "BUY" if is_bullish_setup else "SELL"
+    strategy = "OPENING_MOMENTUM"
+
+    diag_base = {
+        "symbol": symbol,
+        "strategy": strategy,
+        "side": side,
+        "rank": rank,
+        "pct_change": pct_change,
+        "volume": volume,
+        "evaluated_at": now.isoformat(),
+        "pattern_time": None,
+        "status": "REJECTED",
+        "reason": "UNKNOWN",
+        "metrics": {},
+    }
+
+    if not getattr(config, "OPENING_MOMENTUM_ENABLED", True):
+        diag_base["reason"] = "OPENING_MOMENTUM_DISABLED"
+        return diag_base
+
+    if today_pattern_candles is None or today_pattern_candles.empty:
+        diag_base["reason"] = "CANDLE_DATA_UNAVAILABLE"
+        return diag_base
+
+    df = today_pattern_candles.copy().sort_values("timestamp").reset_index(drop=True)
+    if session_date is not None:
+        df["_cdate"] = df["timestamp"].apply(lambda t: t.date() if hasattr(t, "date") else pd.to_datetime(t).date())
+        df = df[df["_cdate"] == session_date].reset_index(drop=True)
+        if df.empty:
+            diag_base["reason"] = "INSUFFICIENT_HISTORY"
+            return diag_base
+
+    first_bar = df.iloc[0]
+    p_time = str(first_bar.get("timestamp"))
+    diag_base["pattern_time"] = p_time
+
+    if is_bullish_setup and not pattern.is_green(first_bar):
+        diag_base["reason"] = "OPENING_CANDLE_NOT_GREEN"
+        return diag_base
+    if not is_bullish_setup and not pattern.is_red(first_bar):
+        diag_base["reason"] = "OPENING_CANDLE_NOT_RED"
+        return diag_base
+
+    if pattern.is_doji(first_bar):
+        diag_base["reason"] = "OPENING_CANDLE_DOJI"
+        return diag_base
+
+    br = pattern.candle_body_ratio(first_bar)
+    bwr = pattern.body_to_wick_ratio(first_bar)
+    min_br = getattr(config, "OPENING_MOMENTUM_MIN_BODY_RATIO", getattr(config, "ALPHA_MIN_TREND_BODY_RATIO", 0.40))
+    min_bwr = getattr(config, "OPENING_MOMENTUM_MIN_BODY_TO_WICK_RATIO", getattr(config, "ALPHA_MIN_TREND_BODY_TO_WICK_RATIO", 1.0))
+
+    if br < min_br:
+        diag_base["reason"] = "OPENING_BODY_RATIO"
+        diag_base["metrics"] = {"body_ratio": round(br, 3), "required": min_br}
+        return diag_base
+
+    if bwr < min_bwr:
+        diag_base["reason"] = "OPENING_BODY_TO_WICK"
+        diag_base["metrics"] = {"body_to_wick_ratio": round(bwr, 3), "required": min_bwr}
+        return diag_base
+
+    diag_base["status"] = "WAITING"
+    diag_base["reason"] = "WAITING_FOR_1M_TRIGGER"
+    diag_base["metrics"] = {
+        "trigger_price": float(first_bar["high"]) if is_bullish_setup else float(first_bar["low"]),
+        "stop_price": float(first_bar["low"]) if is_bullish_setup else float(first_bar["high"]),
+        "body_ratio": round(br, 3),
+        "body_to_wick_ratio": round(bwr, 3),
+    }
+    return diag_base
+
+
 def record_diagnostic(diag: dict) -> None:
     """
     Persists diagnostic into state.py and logs on reason/status transitions.
@@ -694,3 +784,4 @@ def record_diagnostic(diag: dict) -> None:
             state.add_log(f"{symbol} ({strategy} {side}): {reason} [{metrics_str}]")
 
     state.add_signal_diagnostic(diag)
+

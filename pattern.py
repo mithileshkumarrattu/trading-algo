@@ -360,12 +360,19 @@ def find_alpha_setup(pattern_candles, side="BUY"):
         alpha_open_time = alpha.timestamp.to_pydatetime() if hasattr(alpha.timestamp, "to_pydatetime") else alpha.timestamp
         alpha_close_time = alpha_open_time + timedelta(minutes=config.ALPHA_TIMEFRAME)
 
+        if pattern_confirmation_status == "CONFIRMED":
+            stage = "AWAITING_1M_TRIGGER"
+        elif bars_seen == 1:
+            stage = "WAITING_SECOND_3M_CONFIRMATION"
+        else:
+            stage = "WAITING_3M_CONFIRMATION"
+
         return {
             "strategy": "ALPHA",
             "side": side,
             "direction": side,
             "status": pattern_confirmation_status,
-            "stage": "AWAITING_1M_TRIGGER" if pattern_confirmation_status == "CONFIRMED" else "WAITING_3M_CONFIRMATION",
+            "stage": stage,
             "alpha_candle": alpha,
             "alpha_idx": alpha_idx,
             "alpha_open_time": alpha_open_time,
@@ -397,7 +404,7 @@ def find_alpha_setup(pattern_candles, side="BUY"):
 def evaluate_alpha_confirmation(pattern_candles: pd.DataFrame, watchlist_entry: dict) -> dict:
     """
     Evaluates completed pattern candles against an existing watchlist entry waiting for 3m confirmation.
-    Returns dict with status: 'CONFIRMED', 'WAITING_3M_CONFIRMATION', or 'EXPIRED'.
+    Returns dict with status: 'CONFIRMED', 'WAITING_3M_CONFIRMATION', 'WAITING_SECOND_3M_CONFIRMATION', or 'EXPIRED'.
     """
     if pattern_candles is None or pattern_candles.empty:
         return {"status": "WAITING_3M_CONFIRMATION", "bars_seen": 0}
@@ -446,10 +453,76 @@ def evaluate_alpha_confirmation(pattern_candles: pd.DataFrame, watchlist_entry: 
         return {"status": "EXPIRED", "reason": "NO_NEXT_TWO_3M_CONFIRMATION", "bars_seen": bars_seen}
 
     return {
-        "status": "WAITING_3M_CONFIRMATION",
+        "status": "WAITING_SECOND_3M_CONFIRMATION" if bars_seen == 1 else "WAITING_3M_CONFIRMATION",
         "reason": "FIRST_CONFIRMATION_NOT_QUALIFIED" if bars_seen == 1 else "ALPHA_CANDIDATE_FORMED",
         "bars_seen": bars_seen,
         "bars_required": deadline_bars,
+    }
+
+
+def find_opening_momentum_setup(pattern_candles: pd.DataFrame, is_bullish_setup: bool = True, session_date=None) -> dict | None:
+    """
+    Opening Momentum Scanner:
+    Validates completed 09:15-09:18 3m bar (and optional subsequent trend expansion bars up to 09:45).
+    Requires strong body ratio, body-to-wick >= 1.0, and not a doji.
+    Returns opening momentum candidate dict awaiting 1m breakout, or None.
+    """
+    if not getattr(config, "OPENING_MOMENTUM_ENABLED", True):
+        return None
+
+    if pattern_candles is None or pattern_candles.empty:
+        return None
+
+    df = pattern_candles.copy().sort_values("timestamp").reset_index(drop=True)
+    if session_date is not None:
+        df["_cdate"] = df["timestamp"].apply(lambda t: t.date() if hasattr(t, "date") else pd.to_datetime(t).date())
+        df = df[df["_cdate"] == session_date].reset_index(drop=True)
+        if df.empty:
+            return None
+
+    # First completed 3m bar is 09:15-09:18
+    first_bar = df.iloc[0]
+    if is_bullish_setup:
+        if not is_green(first_bar):
+            return None
+    else:
+        if not is_red(first_bar):
+            return None
+
+    if is_doji(first_bar):
+        return None
+
+    br = candle_body_ratio(first_bar)
+    bwr = body_to_wick_ratio(first_bar)
+    min_br = getattr(config, "OPENING_MOMENTUM_MIN_BODY_RATIO", getattr(config, "ALPHA_MIN_TREND_BODY_RATIO", 0.40))
+    min_bwr = getattr(config, "OPENING_MOMENTUM_MIN_BODY_TO_WICK_RATIO", getattr(config, "ALPHA_MIN_TREND_BODY_TO_WICK_RATIO", 1.0))
+
+    if br < min_br or bwr < min_bwr:
+        return None
+
+    # Determine direction and reference levels from opening candle(s)
+    direction = "BUY" if is_bullish_setup else "SELL"
+    c_open_time = first_bar["timestamp"].to_pydatetime() if hasattr(first_bar["timestamp"], "to_pydatetime") else first_bar["timestamp"]
+    c_close_time = c_open_time + timedelta(minutes=int(getattr(config, "PATTERN_TIMEFRAME", 3)))
+
+    high_level = float(first_bar["high"])
+    low_level = float(first_bar["low"])
+    trigger_price = high_level if is_bullish_setup else low_level
+    stop_price = low_level if is_bullish_setup else high_level
+
+    return {
+        "strategy": "OPENING_MOMENTUM",
+        "direction": direction,
+        "is_bullish_setup": is_bullish_setup,
+        "pattern_open_time": c_open_time,
+        "pattern_close_time": c_close_time,
+        "pattern_high": high_level,
+        "pattern_low": low_level,
+        "trigger_price": trigger_price,
+        "stop_price": stop_price,
+        "body_ratio": round(br, 3),
+        "body_to_wick_ratio": round(bwr, 3),
+        "detected_at": datetime.now(config.TIME_ZONE),
     }
 
 

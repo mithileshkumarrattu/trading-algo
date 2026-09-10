@@ -362,7 +362,7 @@ def test_alpha_buy_and_sell_state_transitions():
 
 def test_alpha_candidate_persists_even_with_later_bars():
     # Verify that an earlier Alpha candidate remains detected and waiting for confirmation
-    # even when subsequent pattern bars are formed
+    # even when subsequent pattern bars are formed (1 non-confirming bar -> WAITING_SECOND_3M_CONFIRMATION)
     now = datetime(2026, 9, 4, 10, 0, tzinfo=config.TIME_ZONE)
     candles = [
         {"timestamp": now + timedelta(minutes=0), "open": 100.0, "high": 102.0, "low": 99.8, "close": 101.8, "volume": 1000},
@@ -376,7 +376,7 @@ def test_alpha_candidate_persists_even_with_later_bars():
     df = pd.DataFrame(candles)
     res = pattern.find_alpha_setup(df, side="BUY")
     assert res is not None
-    assert res["stage"] == "WAITING_3M_CONFIRMATION"
+    assert res["stage"] == "WAITING_SECOND_3M_CONFIRMATION"
     assert res["pattern_confirmation_status"] == "WAITING_3M_CONFIRMATION"
     assert res["alpha_high"] == 106.0
 
@@ -390,10 +390,9 @@ def test_alpha_candidate_expires_after_two_non_confirming_bars():
         {"timestamp": now + timedelta(minutes=6), "open": 103.8, "high": 106.0, "low": 103.5, "close": 105.8, "volume": 1000},
         # Candidate Red Alpha Pullback
         {"timestamp": now + timedelta(minutes=9), "open": 105.8, "high": 106.0, "low": 104.5, "close": 104.8, "volume": 1000},
-        # Bar 1 after alpha: no confirm
-        {"timestamp": now + timedelta(minutes=12), "open": 104.8, "high": 105.5, "low": 104.0, "close": 104.5, "volume": 900},
-        # Bar 2 after alpha: no confirm
-        {"timestamp": now + timedelta(minutes=15), "open": 104.5, "high": 105.0, "low": 103.5, "close": 104.0, "volume": 800},
+        # Two non-confirming bars
+        {"timestamp": now + timedelta(minutes=12), "open": 104.8, "high": 105.5, "low": 104.2, "close": 105.0, "volume": 900},
+        {"timestamp": now + timedelta(minutes=15), "open": 105.0, "high": 105.8, "low": 104.0, "close": 105.2, "volume": 850},
     ]
     df = pd.DataFrame(candles)
     res = pattern.find_alpha_setup(df, side="BUY")
@@ -401,21 +400,9 @@ def test_alpha_candidate_expires_after_two_non_confirming_bars():
 
 
 def test_entry_extension_rejection():
-    # Trigger level is 100.0, max extension allowed is 0.35% (up to 100.35)
-    # Entry at 100.20 -> extension 0.20% <= 0.35% -> Passes
-    ext_pass = pattern.entry_extension_pct(100.20, 100.0, side="BUY")
-    assert round(ext_pass, 2) == 0.20
-    assert ext_pass <= config.ALPHA_MAX_ENTRY_EXTENSION_PCT
-
-    # Entry at 100.60 -> extension 0.60% > 0.35% -> Rejected
-    ext_fail = pattern.entry_extension_pct(100.60, 100.0, side="BUY")
-    assert round(ext_fail, 2) == 0.60
-    assert ext_fail > config.ALPHA_MAX_ENTRY_EXTENSION_PCT
-
-    # SELL test: trigger 100.0, entry at 99.40 -> extension 0.60% > 0.35%
-    ext_sell_fail = pattern.entry_extension_pct(99.40, 100.0, side="SELL")
-    assert round(ext_sell_fail, 2) == 0.60
-    assert ext_sell_fail > config.ALPHA_MAX_ENTRY_EXTENSION_PCT
+    assert pattern.entry_extension_pct(100.50, 100.0, "BUY") == 0.50
+    assert pattern.entry_extension_pct(99.50, 100.0, "BUY") == 0.0
+    assert pattern.entry_extension_pct(99.50, 100.0, "SELL") == 0.50
 
 
 def test_market_regime_allows_setup_policy():
@@ -428,7 +415,7 @@ def test_market_regime_allows_setup_policy():
     assert mode == "ALIGNED"
     assert reason == "REGIME_ALIGNED"
 
-    # Aligned BUY with move < 1.0% -> MOVE_TOO_SMALL
+    # Aligned BUY with move < 0.75% -> MOVE_TOO_SMALL
     ok, mode, reason = main.market_regime_allows_setup("BUY", "BULLISH", 0.5)
     assert ok is False
     assert mode == "ALIGNED"
@@ -445,7 +432,8 @@ def test_market_regime_allows_setup_policy():
     assert mode == "NEUTRAL"
     assert reason == "REGIME_NEUTRAL_STRENGTH_OK"
 
-    ok, mode, reason = main.market_regime_allows_setup("SELL", "UNKNOWN", -1.2)
+    # Neutral with move < 1.00% -> NEUTRAL_REGIME_MOVE_TOO_SMALL
+    ok, mode, reason = main.market_regime_allows_setup("SELL", "UNKNOWN", -0.8)
     assert ok is False
     assert mode == "NEUTRAL"
     assert reason == "NEUTRAL_REGIME_MOVE_TOO_SMALL"
@@ -780,3 +768,201 @@ def test_alpha_candidate_second_bar_confirmation_progresses():
     eval_res = pattern.evaluate_alpha_confirmation(df, watchlist_entry)
     assert eval_res["status"] == "CONFIRMED"
     assert eval_res["bars_seen"] == 2
+
+
+def test_alpha_4_stage_state_machine_transitions():
+    """Test full Alpha 4-stage lifecycle across 0, 1, 2 confirmation bars and expiration."""
+    now = datetime(2026, 9, 9, 9, 45, tzinfo=config.TIME_ZONE)
+    base_run = [
+        {"timestamp": now - timedelta(minutes=12), "open": 100.0, "high": 102.0, "low": 99.0, "close": 101.5, "volume": 1000},
+        {"timestamp": now - timedelta(minutes=9), "open": 101.5, "high": 104.0, "low": 101.0, "close": 103.5, "volume": 1000},
+        {"timestamp": now - timedelta(minutes=6), "open": 103.5, "high": 106.0, "low": 103.0, "close": 105.5, "volume": 1000},
+        # Alpha candle (Red)
+        {"timestamp": now - timedelta(minutes=3), "open": 105.5, "high": 106.0, "low": 103.8, "close": 104.0, "volume": 1000},
+    ]
+
+    # Stage 1: 0 confirmation bars seen -> WAITING_3M_CONFIRMATION
+    df_0 = pd.DataFrame(base_run)
+    res_0 = pattern.find_alpha_setup(df_0, side="BUY")
+    assert res_0 is not None
+    assert res_0["stage"] == "WAITING_3M_CONFIRMATION"
+    assert res_0["confirmation_bars_seen"] == 0
+
+    # Stage 2: 1 non-confirming bar seen -> WAITING_SECOND_3M_CONFIRMATION
+    bar_1 = {"timestamp": now, "open": 104.0, "high": 105.0, "low": 103.5, "close": 104.5, "volume": 900}
+    df_1 = pd.DataFrame(base_run + [bar_1])
+    res_1 = pattern.find_alpha_setup(df_1, side="BUY")
+    assert res_1 is not None
+    assert res_1["stage"] == "WAITING_SECOND_3M_CONFIRMATION"
+    assert res_1["confirmation_bars_seen"] == 1
+
+    # Stage 3: 2 bars with successful confirmation on 2nd bar -> AWAITING_1M_TRIGGER
+    bar_2_confirm = {"timestamp": now + timedelta(minutes=3), "open": 104.5, "high": 107.5, "low": 104.0, "close": 107.0, "volume": 1500}
+    df_2_conf = pd.DataFrame(base_run + [bar_1, bar_2_confirm])
+    res_2_conf = pattern.find_alpha_setup(df_2_conf, side="BUY")
+    assert res_2_conf is not None
+    assert res_2_conf["status"] == "CONFIRMED"
+    assert res_2_conf["stage"] == "AWAITING_1M_TRIGGER"
+
+    # Stage 4: 2 bars both non-confirming -> Expired
+    bar_2_fail = {"timestamp": now + timedelta(minutes=3), "open": 104.5, "high": 105.5, "low": 104.0, "close": 104.8, "volume": 900}
+    df_2_fail = pd.DataFrame(base_run + [bar_1, bar_2_fail])
+    res_2_fail = pattern.find_alpha_setup(df_2_fail, side="BUY")
+    assert res_2_fail is None
+
+    # Test evaluate_alpha_confirmation returns EXPIRED on 2 non-confirming bars
+    alpha_close_iso = (now - timedelta(minutes=3) + timedelta(minutes=3)).isoformat()
+    w_entry = {"direction": "BUY", "alpha_high": 106.0, "alpha_low": 103.8, "alpha_close_time": alpha_close_iso, "alpha_volume": 1000}
+    eval_exp = pattern.evaluate_alpha_confirmation(df_2_fail, w_entry)
+    assert eval_exp["status"] == "EXPIRED"
+    assert eval_exp["reason"] == "NO_NEXT_TWO_3M_CONFIRMATION"
+
+
+def test_opening_momentum_detection_only(monkeypatch):
+    """Test Opening Momentum detection only logs trigger and does not call enter_trade."""
+    monkeypatch.setattr(config, "OPENING_MOMENTUM_ENABLED", True)
+    monkeypatch.setattr(config, "OPENING_MOMENTUM_DETECTION_ONLY", True)
+
+    captured = {}
+    def fake_log_outcome(setup, outcome, details=""):
+        captured["outcome"] = outcome
+        captured["details"] = details
+
+    def fake_enter_trade(*args, **kwargs):
+        raise AssertionError("enter_trade must NEVER be called when OPENING_MOMENTUM_DETECTION_ONLY is True")
+
+    monkeypatch.setattr(state, "log_setup_outcome", fake_log_outcome)
+    monkeypatch.setattr(main.engine, "enter_trade", fake_enter_trade)
+    monkeypatch.setattr(state, "snapshot", lambda: {"open_positions": {}})
+
+    setup = {
+        "security_id": "999",
+        "symbol": "TATACHEM",
+        "strategy": "OPENING_MOMENTUM",
+        "direction": "BUY",
+        "trigger_price": 1000.0,
+        "stop_price": 980.0,
+        "pattern_open_time": "2026-09-09T09:15:00+05:30",
+        "pattern_close_time": "2026-09-09T09:18:00+05:30",
+        "expires_at": "2026-09-09T09:33:00+05:30",
+        "alpha_key": "OPENING_MOMENTUM_999_BUY_2026-09-09T09:15:00+05:30",
+    }
+
+    # 1-minute breakout candle at 09:19 (high=1005 > trigger=1000)
+    latest_1m = {
+        "timestamp": datetime(2026, 9, 9, 9, 19, tzinfo=config.TIME_ZONE),
+        "open": 998.0,
+        "high": 1005.0,
+        "low": 997.0,
+        "close": 1003.0,
+    }
+
+    res = main.process_new_1m_bar_for_setup(None, setup, latest_1m)
+    assert res == "OPENING_MOMENTUM_TRIGGER_DETECTED_ONLY"
+    assert captured["outcome"] == "OPENING_MOMENTUM_TRIGGER_DETECTED_ONLY"
+
+
+def test_selective_thresholds_applied():
+    """Verify selective thresholds: Alpha trend 0.40, Alpha pullback 0.25, Alpha vol 0.80, JP vol 0.75-2.25."""
+    assert config.ALPHA_MIN_TREND_BODY_RATIO == 0.40
+    assert config.ALPHA_MIN_ALPHA_BODY_RATIO == 0.25
+    assert config.ALPHA_MIN_TREND_VOLUME_RATIO == 0.80
+    assert config.JP_MIN_VOLUME_RATIO == 0.75
+    assert config.JP_MAX_VOLUME_RATIO == 2.25
+    assert config.DOJI_BODY_RATIO == 0.18
+    assert config.ALPHA_MIN_TREND_BODY_TO_WICK_RATIO == 1.0
+    assert config.ALPHA_MIN_ALPHA_BODY_TO_WICK_RATIO == 1.0
+    assert config.JP_MIN_BODY_TO_WICK_RATIO == 1.0
+    assert config.JP_MIN_BODY_RATIO == 0.25
+
+
+def test_countertrend_policy_and_1m_close_requirement(monkeypatch):
+    """Verify countertrend policy moves and 1m close requirement rejection."""
+    # 1. Market regime allow function moves
+    allowed_aligned, mode_al, _ = main.market_regime_allows_setup("BUY", "BULLISH", 0.80)
+    assert allowed_aligned is True and mode_al == "ALIGNED"
+
+    allowed_aligned_fail, _, _ = main.market_regime_allows_setup("BUY", "BULLISH", 0.60)
+    assert allowed_aligned_fail is False
+
+    allowed_neutral, mode_neu, _ = main.market_regime_allows_setup("BUY", "NEUTRAL", 1.10)
+    assert allowed_neutral is True and mode_neu == "NEUTRAL"
+
+    allowed_counter, mode_ct, _ = main.market_regime_allows_setup("BUY", "BEARISH", 1.60)
+    assert allowed_counter is True and mode_ct == "COUNTERTREND"
+
+    allowed_counter_fail, _, _ = main.market_regime_allows_setup("BUY", "BEARISH", 1.30)
+    assert allowed_counter_fail is False
+
+    # 2. Countertrend 1m close rejection when high crosses but close does not
+    monkeypatch.setattr(config, "REGIME_COUNTERTREND_REQUIRE_1M_CLOSE_CONFIRMATION", True)
+    captured = {}
+    monkeypatch.setattr(state, "log_setup_outcome", lambda setup, outcome, details="": captured.update({"outcome": outcome}))
+    monkeypatch.setattr(state, "snapshot", lambda: {"open_positions": {}})
+
+    setup = {
+        "security_id": "888",
+        "symbol": "CANBK",
+        "strategy": "ALPHA",
+        "direction": "BUY",
+        "trigger_price": 100.0,
+        "pattern_close_time": "2026-09-09T09:24:00+05:30",
+        "expires_at": "2026-09-09T09:40:00+05:30",
+        "regime_mode": "COUNTERTREND",
+        "signal_quality": {"confirmation_volume_ratio": 1.60},
+    }
+
+    # Wick crossed (high=101.0 > 100.0) but close did not (close=99.5 <= 100.0)
+    bar = {
+        "timestamp": datetime(2026, 9, 9, 9, 25, tzinfo=config.TIME_ZONE),
+        "open": 99.0,
+        "high": 101.0,
+        "low": 98.5,
+        "close": 99.5,
+    }
+    res = main.process_new_1m_bar_for_setup(None, setup, bar)
+    assert res == "COUNTERTREND_1M_CLOSE_NOT_CONFIRMED"
+    assert captured["outcome"] == "COUNTERTREND_1M_CLOSE_NOT_CONFIRMED"
+
+
+def test_terminal_outcome_logging_for_all_paths(monkeypatch):
+    """Verify explicit terminal outcomes logged on expiration, late trigger, extension, and entry."""
+    outcomes = []
+    monkeypatch.setattr(state, "log_setup_outcome", lambda setup, outcome, details="": outcomes.append(outcome))
+    monkeypatch.setattr(state, "snapshot", lambda: {"open_positions": {}})
+
+    # 1. SETUP_EXPIRED
+    now = datetime.now(config.TIME_ZONE)
+    setup_exp = {
+        "security_id": "101", "symbol": "S1", "strategy": "JP", "direction": "BUY",
+        "trigger_price": 100.0, "pattern_close_time": (now - timedelta(minutes=30)).isoformat(),
+        "expires_at": (now - timedelta(minutes=15)).isoformat(),
+    }
+    bar_exp = {"timestamp": now - timedelta(minutes=10), "high": 99.0, "close": 98.0}
+    main.process_new_1m_bar_for_setup(None, setup_exp, bar_exp)
+    assert "SETUP_EXPIRED" in outcomes
+
+    # 2. SKIPPED_LATE_TRIGGER
+    monkeypatch.setattr(config, "MAX_ENTRY_DELAY_SECONDS", 10)
+    setup_late = {
+        "security_id": "102", "symbol": "S2", "strategy": "ALPHA", "direction": "BUY",
+        "trigger_price": 100.0, "pattern_close_time": (now - timedelta(minutes=20)).isoformat(),
+        "expires_at": (now + timedelta(minutes=10)).isoformat(),
+    }
+    # Bar from 5 minutes ago (delay = 4 mins > 10 seconds)
+    old_bar = {"timestamp": now - timedelta(minutes=5), "high": 102.0, "close": 101.0}
+    main.process_new_1m_bar_for_setup(None, setup_late, old_bar)
+    assert "SKIPPED_LATE_TRIGGER" in outcomes
+
+    # 3. ENTRY_REJECTED_EXTENSION
+    mock_broker = MagicMock()
+    mock_broker.get_ltp.return_value = 105.0  # 5% extension above 100.0 > max 0.35%
+    setup_ext = {
+        "security_id": "103", "symbol": "S3", "strategy": "ALPHA", "direction": "BUY",
+        "trigger_price": 100.0, "pattern_close_time": (now - timedelta(minutes=10)).isoformat(),
+        "expires_at": (now + timedelta(minutes=10)).isoformat(),
+    }
+    now_bar = {"timestamp": now - timedelta(seconds=2), "high": 101.0, "close": 100.8}
+    main.process_new_1m_bar_for_setup(mock_broker, setup_ext, now_bar)
+    assert "ENTRY_REJECTED_EXTENSION" in outcomes
+
