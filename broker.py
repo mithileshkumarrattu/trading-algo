@@ -218,50 +218,64 @@ class DhanBroker(metaclass=SingletonMeta):
 
     def place_order(self, security_id, transaction_type, exchange_segment, qty,
                      order_type="LIMIT", product_type="INTRADAY", limit_price=0,
-                     trigger_price=0, tick_size=0.05):
+                     trigger_price=0, tick_size=0.05, correlation_id=None):
         try:
-            res = self.dhan.place_order(
-                security_id=str(security_id),
-                exchange_segment=exchange_segment,
-                transaction_type=transaction_type,
-                quantity=int(qty),
-                order_type=order_type,
-                product_type=product_type,
-                price=self.truncate(limit_price, tick_size),
-                trigger_price=self.truncate(trigger_price, tick_size),
-                tag=self.ordertag,
-            )
-            logger.info(f"place_order -> {security_id} {transaction_type} {qty} {order_type} limit={limit_price} trigger={trigger_price} :: {res}")
+            kwargs = {
+                "security_id": str(security_id),
+                "exchange_segment": exchange_segment,
+                "transaction_type": transaction_type,
+                "quantity": int(qty),
+                "order_type": order_type,
+                "product_type": product_type,
+                "price": self.truncate(limit_price, tick_size),
+                "trigger_price": self.truncate(trigger_price, tick_size),
+                "tag": correlation_id or self.ordertag,
+            }
+            if correlation_id:
+                kwargs["correlation_id"] = str(correlation_id)
+            res = self.dhan.place_order(**kwargs)
+            logger.info(f"place_order -> {security_id} {transaction_type} {qty} {order_type} limit={limit_price} trigger={trigger_price} correlation={correlation_id} :: {res}")
             if res and res.get("status") == "success":
-                return res["data"]["orderId"]
+                data = res.get("data", {})
+                return data.get("orderId") or data.get("order_id")
         except Exception:
             logger.exception(f"Error placing order for {security_id}")
         return None
 
-    def modify_order(self, order_info: dict, new_trigger_price, tick_size=0.05, new_limit_price=None):
+    def modify_order(self, order_id_or_info, order_type="STOP_LOSS", quantity=0,
+                     limit_price=None, trigger_price=0, tick_size=0.05,
+                     disclosed_quantity=0, validity="DAY"):
         try:
-            if new_limit_price is None:
-                new_limit_price = (new_trigger_price + 10 * tick_size) if order_info["transactionType"] == "BUY" else (new_trigger_price - 10 * tick_size)
-            order_id = order_info.get("orderId") or order_info.get("orderNo")
+            if isinstance(order_id_or_info, dict):
+                order_id = order_id_or_info.get("orderId") or order_id_or_info.get("orderNo")
+                order_type = order_id_or_info.get("orderType", order_type)
+                quantity = order_id_or_info.get("quantity", quantity)
+                leg_name = order_id_or_info.get("legName", "NA")
+                disclosed_quantity = order_id_or_info.get("disclosedQuantity", disclosed_quantity)
+                validity = order_id_or_info.get("validity", validity)
+            else:
+                order_id = str(order_id_or_info)
+                leg_name = "NA"
+
             res = self.dhan.modify_order(
                 order_id=order_id,
-                order_type=order_info["orderType"],
-                leg_name=order_info.get("legName", "NA"),
-                quantity=order_info["quantity"],
-                price=new_limit_price,
-                trigger_price=self.truncate(new_trigger_price, tick_size),
-                disclosed_quantity=order_info.get("disclosedQuantity", 0),
-                validity=order_info.get("validity", "DAY"),
+                order_type=order_type,
+                leg_name=leg_name,
+                quantity=int(quantity),
+                price=self.truncate(limit_price, tick_size) if limit_price else 0.0,
+                trigger_price=self.truncate(trigger_price, tick_size) if trigger_price else 0.0,
+                disclosed_quantity=disclosed_quantity,
+                validity=validity,
             )
-            logger.info(f"modify_order -> {order_id} new_trigger={new_trigger_price} :: {res}")
+            logger.info(f"modify_order -> {order_id} new_trigger={trigger_price} new_limit={limit_price} :: {res}")
             return res
         except Exception:
-            logger.exception(f"Error modifying order {order_info}")
+            logger.exception(f"Error modifying order {order_id_or_info}")
         return None
 
     def cancel_order(self, order_id):
         try:
-            res = self.dhan.cancel_order(order_id)
+            res = self.dhan.cancel_order(str(order_id))
             logger.info(f"cancel_order -> {order_id} :: {res}")
             return res
         except Exception:
@@ -269,15 +283,47 @@ class DhanBroker(metaclass=SingletonMeta):
         return None
 
     def get_order_by_id(self, order_id):
-        for _ in range(6):
+        for _ in range(3):
             try:
-                res = self.dhan.get_order_by_id(order_id)
+                res = self.dhan.get_order_by_id(str(order_id))
                 if res and res.get("status") == "success":
-                    return res["data"][0]
+                    data = res.get("data", [])
+                    return data[0] if isinstance(data, list) and data else data
             except Exception:
                 logger.exception(f"Error fetching order {order_id}")
-            sleep(1)
+            sleep(0.5)
         return None
+
+    def get_order_by_correlation_id(self, correlation_id):
+        try:
+            if hasattr(self.dhan, "get_order_by_correlationID"):
+                res = self.dhan.get_order_by_correlationID(str(correlation_id))
+                if res and res.get("status") == "success":
+                    data = res.get("data", [])
+                    return data[0] if isinstance(data, list) and data else data
+        except Exception:
+            logger.exception(f"Error fetching order by correlation_id {correlation_id}")
+        return None
+
+    def get_order_list(self):
+        try:
+            res = self.dhan.get_order_list()
+            if res and res.get("status") == "success":
+                data = res.get("data", [])
+                return data if isinstance(data, list) else []
+        except Exception:
+            logger.exception("Error fetching order list")
+        return []
+
+    def get_trade_book(self):
+        try:
+            res = self.dhan.get_trade_book()
+            if res and res.get("status") == "success":
+                data = res.get("data", [])
+                return data if isinstance(data, list) else []
+        except Exception:
+            logger.exception("Error fetching trade book")
+        return []
 
     def get_order_status(self, order_id):
         order_id = str(order_id)

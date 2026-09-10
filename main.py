@@ -30,10 +30,15 @@ import jp_pattern
 import signal_diagnostics
 import engine
 import notifier
+import journal
+import reconciliation
+import execution
 from broker import DhanBroker
 
 _stop_event = threading.Event()
 _cache_lock = threading.Lock()
+_cache_inflight = {}
+_candle_fetch_semaphore = threading.Semaphore(getattr(config, "MAX_CANDLE_FETCH_WORKERS", 2))
 _candle_cache = {}
 _pattern_candle_cache = {}
 _jp_pattern_candle_cache = {}
@@ -58,18 +63,37 @@ def get_cached_candles(broker, security_id, prev_trade_date, timeframe, ttl_seco
         cached = _candle_cache.get(key)
         if cached and now - cached["fetched_at"] < ttl_seconds:
             return cached["data"]
+        event = _cache_inflight.get(key)
+        if event is None:
+            event = threading.Event()
+            _cache_inflight[key] = event
+            fetch_owner = True
+        else:
+            fetch_owner = False
 
-    candles = broker.get_intraday_candles(
-        security_id=security_id,
-        exchange_segment=config.EXCHANGE,
-        instrument_type="EQUITY",
-        from_dt=prev_trade_date,
-        timeframe=timeframe,
-    )
-    if candles is not None and not candles.empty:
+    if not fetch_owner:
+        event.wait(timeout=3.0)
         with _cache_lock:
-            _candle_cache[key] = {"fetched_at": now, "data": candles}
-    return candles
+            cached = _candle_cache.get(key)
+            return cached["data"] if cached else None
+
+    try:
+        with _candle_fetch_semaphore:
+            candles = broker.get_intraday_candles(
+                security_id=security_id,
+                exchange_segment=config.EXCHANGE,
+                instrument_type="EQUITY",
+                from_dt=prev_trade_date,
+                timeframe=timeframe,
+            )
+        if candles is not None and not candles.empty:
+            with _cache_lock:
+                _candle_cache[key] = {"fetched_at": time.time(), "data": candles}
+        return candles
+    finally:
+        with _cache_lock:
+            _cache_inflight.pop(key, None)
+        event.set()
 
 
 def get_cached_pattern_candles(broker, security_id, prev_trade_date, timeframe):
@@ -79,15 +103,35 @@ def get_cached_pattern_candles(broker, security_id, prev_trade_date, timeframe):
         cached = _pattern_candle_cache.get(key)
         if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
             return cached["data"]
-    candles = broker.get_pattern_candles(
-        security_id=security_id, exchange_segment=config.EXCHANGE,
-        instrument_type="EQUITY", from_dt=prev_trade_date,
-        pattern_timeframe=timeframe,
-    )
-    if candles is not None and not candles.empty:
+        event = _cache_inflight.get(key)
+        if event is None:
+            event = threading.Event()
+            _cache_inflight[key] = event
+            fetch_owner = True
+        else:
+            fetch_owner = False
+
+    if not fetch_owner:
+        event.wait(timeout=3.0)
         with _cache_lock:
-            _pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
-    return candles
+            cached = _pattern_candle_cache.get(key)
+            return cached["data"] if cached else None
+
+    try:
+        with _candle_fetch_semaphore:
+            candles = broker.get_pattern_candles(
+                security_id=security_id, exchange_segment=config.EXCHANGE,
+                instrument_type="EQUITY", from_dt=prev_trade_date,
+                pattern_timeframe=timeframe,
+            )
+        if candles is not None and not candles.empty:
+            with _cache_lock:
+                _pattern_candle_cache[key] = {"fetched_at": time.time(), "data": candles}
+        return candles
+    finally:
+        with _cache_lock:
+            _cache_inflight.pop(key, None)
+        event.set()
 
 
 def get_cached_jp_pattern_candles_with_warmup(broker, security_id, prev_trade_date):
@@ -100,18 +144,37 @@ def get_cached_jp_pattern_candles_with_warmup(broker, security_id, prev_trade_da
         cached = _jp_pattern_candle_cache.get(key)
         if cached and now - cached["fetched_at"] < config.CANDLE_CACHE_TTL_PATTERN_SEC:
             return cached["data"]
+        event = _cache_inflight.get(key)
+        if event is None:
+            event = threading.Event()
+            _cache_inflight[key] = event
+            fetch_owner = True
+        else:
+            fetch_owner = False
 
-    candles = broker.get_pattern_candles_with_warmup(
-        security_id=security_id,
-        exchange_segment=config.EXCHANGE,
-        instrument_type="EQUITY",
-        prev_trade_date=prev_trade_date,
-        pattern_timeframe=config.JP_TIMEFRAME,
-    )
-    if candles is not None and not candles.empty:
+    if not fetch_owner:
+        event.wait(timeout=3.0)
         with _cache_lock:
-            _jp_pattern_candle_cache[key] = {"fetched_at": now, "data": candles}
-    return candles
+            cached = _jp_pattern_candle_cache.get(key)
+            return cached["data"] if cached else None
+
+    try:
+        with _candle_fetch_semaphore:
+            candles = broker.get_pattern_candles_with_warmup(
+                security_id=security_id,
+                exchange_segment=config.EXCHANGE,
+                instrument_type="EQUITY",
+                prev_trade_date=prev_trade_date,
+                pattern_timeframe=config.JP_TIMEFRAME,
+            )
+        if candles is not None and not candles.empty:
+            with _cache_lock:
+                _jp_pattern_candle_cache[key] = {"fetched_at": time.time(), "data": candles}
+        return candles
+    finally:
+        with _cache_lock:
+            _cache_inflight.pop(key, None)
+        event.set()
 
 
 def check_alpha_entry(broker, security_id, symbol, is_bullish_setup,
@@ -290,13 +353,22 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
     bar_close_at = bar_time + timedelta(minutes=1)
     delay_seconds = (now - bar_close_at).total_seconds()
 
-    if delay_seconds > config.MAX_ENTRY_DELAY_SECONDS:
-        state.log_setup_outcome(setup, "SKIPPED_LATE_TRIGGER", f"delay={delay_seconds:.1f}s")
-        if strategy == "JP":
-            state.remove_jp_setup(security_id)
+    max_delay = getattr(config, "MAX_ENTRY_DELAY_SECONDS", 8)
+    degraded_max = getattr(config, "MAX_ENTRY_DELAY_DEGRADED_SECONDS", 15)
+
+    if delay_seconds > max_delay:
+        snap = state.snapshot()
+        feed_healthy = snap.get("websocket_connected", False) or (snap.get("livefeed_coverage", 0) >= getattr(config, "MIN_WEBSOCKET_COVERAGE_PCT", 60.0))
+        reconciled_clean = not journal.is_circuit_breaker_active()
+        if delay_seconds <= degraded_max and feed_healthy and reconciled_clean:
+            state.add_log(f"{symbol}: Entry taking degraded latency path (delay={delay_seconds:.1f}s <= {degraded_max}s)")
         else:
-            state.remove_alpha_setup(security_id)
-        return "SKIPPED_LATE_TRIGGER"
+            state.log_setup_outcome(setup, "SKIPPED_LATE_TRIGGER", f"delay={delay_seconds:.1f}s")
+            if strategy == "JP":
+                state.remove_jp_setup(security_id)
+            else:
+                state.remove_alpha_setup(security_id)
+            return "SKIPPED_LATE_TRIGGER"
 
     ltp = broker.get_ltp(security_id, config.EXCHANGE)
     if ltp is None:
@@ -311,7 +383,7 @@ def process_new_1m_bar_for_setup(broker, setup, latest_completed_1m_bar):
 
     # Check entry extension percentage (prevent chasing price when it has moved too far past trigger)
     ext_pct = pattern.entry_extension_pct(fill, trigger_level, side=direction)
-    max_ext_pct = getattr(config, "ALPHA_MAX_ENTRY_EXTENSION_PCT", 0.35)
+    max_ext_pct = getattr(config, "MAX_ENTRY_EXTENSION_PCT", getattr(config, "ALPHA_MAX_ENTRY_EXTENSION_PCT", 0.15))
     if ext_pct > max_ext_pct:
         state.log_setup_outcome(setup, "ENTRY_REJECTED_EXTENSION", f"ext={ext_pct:.2f}% > max={max_ext_pct:.2f}%")
         state.add_log(f"{symbol}: Entry rejected - extension {ext_pct:.2f}% exceeds {max_ext_pct:.2f}%")
@@ -1141,11 +1213,21 @@ def scan_loop(broker, prev_trade_date):
         time.sleep(1.0)
 
 
+def reconciliation_loop(broker):
+    while run_flag():
+        try:
+            if getattr(config, "EXECUTION_MODE", "PAPER") in ("SHADOW", "LIVE"):
+                reconciliation.reconcile_broker_state(broker)
+        except Exception:
+            logger.exception("Error in background reconciliation loop")
+        time.sleep(getattr(config, "LIVE_RECONCILE_INTERVAL_SECONDS", 15))
+
+
 def main():
     validate_runtime_config()
     state.reset_daily()
     state.update({"started_at": datetime.now(config.TIME_ZONE).isoformat(), "paper_mode": config.PAPER_MODE})
-    state.add_log(f"AlphaCandle starting. PAPER_MODE={config.PAPER_MODE}")
+    state.add_log(f"AlphaCandle starting. MODE={config.EXECUTION_MODE}, PAPER_MODE={config.PAPER_MODE}")
 
     wait_until(config.START_TIME)
 
@@ -1155,6 +1237,9 @@ def main():
         notifier.notify_login(margin_data.get("availabelBalance"))
     else:
         notifier.notify_login_failed()
+
+    # Startup reconciliation with broker
+    reconciliation.reconcile_broker_state(broker)
 
     universe_df = universe.build_fno_universe()
     state.update({"universe_size": len(universe_df)})
@@ -1213,6 +1298,7 @@ def main():
     threading.Thread(target=discovery.discovery_loop, args=(broker, universe_df, run_flag), daemon=True).start()
     threading.Thread(target=regime_loop, args=(broker,), daemon=True).start()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    threading.Thread(target=reconciliation_loop, args=(broker,), daemon=True).start()
 
     state.update({"run_process": True})
 

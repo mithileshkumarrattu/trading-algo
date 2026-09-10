@@ -19,11 +19,16 @@ TOTP_TOKEN = 'VPCBECBLGLWE7VJ2GSHVLXY3O3OIP3BH'
 BOT_TOKEN = "8939945606:AAHA_dLTkJDBHDnX1JznDcw3PXqD654rxrE"
 BOT_CHAT_ID = "-1004313459571"
 
-# ---------------- SAFETY SWITCH ----------------
-# True  -> NO real Dhan order/modify/cancel call is EVER made. Entries/exits
-#          are fully simulated in-memory using real live prices.
-# False -> Real orders placed. Only flip after verified paper sessions.
-PAPER_MODE = True
+# ---------------- SAFETY SWITCH & EXECUTION MODE ----------------
+# Execution Modes:
+#   - "PAPER":  Simulated fills & synthetic tracking, no broker order endpoints called.
+#   - "SHADOW": Live account reads, quote/spread/depth validation, margin & sizing checks,
+#               produces order intents without submitting real orders.
+#   - "LIVE":   Real broker order execution (gated by LIVE_TRADING_ENABLED=True).
+EXECUTION_MODE = "PAPER"
+LIVE_TRADING_ENABLED = False
+LIVE_ARMED_CONFIRMATION_TOKEN = ""
+PAPER_MODE = (EXECUTION_MODE != "LIVE" or not LIVE_TRADING_ENABLED)
 
 # ---------------- BROKER / EXCHANGE ----------------
 EXCHANGE = "NSE_EQ"
@@ -42,6 +47,11 @@ JP_TIMEFRAME = 3
 ENTRY_TIMEFRAME = 1
 CANDLE_CACHE_TTL_PATTERN_SEC = 15
 CANDLE_CACHE_TTL_1M_SEC = 15
+
+# ---------------- RATE LIMITING & CONCURRENCY ----------------
+MAX_CANDLE_FETCH_WORKERS = 2
+DATA_API_REQUESTS_PER_SECOND = 4
+QUOTE_API_REQUESTS_PER_SECOND = 1
 
 # ---------------- DERIVED 3-MIN CANDLES ----------------
 MARKET_OPEN_TIME = (9, 15)
@@ -294,14 +304,48 @@ MAX_ALPHA_RANGE_PCT = 0.85
 MAX_STOP_DISTANCE_PCT = 0.90
 MIN_BREAKOUT_BODY_RATIO = 0.35
 
-# ---------------- RISK ----------------
+# ---------------- RISK & ENTRY QUALITY ----------------
 STOP_BUFFER_PCT = 0.10
 STOP_BUFFER_MIN_POINTS = 0.05
 BREAKEVEN_AT_R = 1.0
 PARTIAL_BOOK_AT_R = 2.0
 PARTIAL_BOOK_FRACTION = 0.50
 TRAIL_DISTANCE_R = 0.75
-MAX_ENTRY_DELAY_SECONDS = 75
+
+MAX_ENTRY_DELAY_SECONDS = 8
+MAX_ENTRY_DELAY_DEGRADED_SECONDS = 15
+MAX_ENTRY_EXTENSION_PCT = 0.35
+MAX_BID_ASK_SPREAD_PCT = 0.10
+MAX_QUOTE_AGE_SECONDS = 2
+
+# ---------------- PROTECTIVE WORKFLOW & TIMEOUTS ----------------
+ENTRY_ORDER_TIMEOUT_SECONDS = 8
+PROTECTIVE_STOP_TIMEOUT_SECONDS = 5
+EXIT_ORDER_TIMEOUT_SECONDS = 8
+EMERGENCY_EXIT_ON_STOP_FAILURE = True
+BLOCK_NEW_ENTRIES_AFTER_EXECUTION_ERROR = True
+
+# ---------------- CONSERVATIVE PILOT RISK CAPS ----------------
+SL_POINTS_MIN = 2.0
+SL_POINTS_MAX = 3.0
+RISK_PER_TRADE = 50.0
+MAX_NOTIONAL_PER_TRADE = 5_000
+MAX_GROSS_NOTIONAL = 5_000
+MAX_OPEN_POSITIONS = 1
+MAX_PENDING_ENTRY_ORDERS = 1
+MAX_PENDING_EXIT_ORDERS = 3
+MAX_DAILY_TRADES = 1
+MAX_TRADES_PER_DAY = 1
+MAX_LOSS_PER_DAY = 100.0
+MAX_CONSECUTIVE_LOSSES = 1
+MAX_LOSS_PER_SYMBOL = 250.0
+MARGIN_BUFFER_RUPEES = 2_000
+
+# ---------------- HEALTH & RECONCILIATION ----------------
+LIVE_REQUIRE_ORDER_UPDATE_FEED = True
+LIVE_REQUIRE_BROKER_RECONCILIATION = True
+LIVE_RECONCILE_INTERVAL_SECONDS = 15
+LIVE_MAX_RECONCILIATION_AGE_SECONDS = 20
 
 # ---------------- PAPER EXECUTION ----------------
 PAPER_SLIPPAGE_BPS = 2
@@ -310,17 +354,8 @@ PAPER_SLIPPAGE_BPS = 2
 MIN_TREND_CANDLES = 3
 DOJI_BODY_RATIO = 0.15          # body/range below this = doji, candle rejected
 
-# ---------------- RISK / SIZING ----------------
-SL_POINTS_MIN = 2.0
-SL_POINTS_MAX = 3.0
-RISK_PER_TRADE = 200.0
-MAX_LOSS_PER_DAY = 2000.0
-MAX_TRADES_PER_DAY = 5
-MAX_OPEN_POSITIONS = 3
-
 # ---------------- EXIT MANAGEMENT ----------------
 FIRST_TARGET_R_MULTIPLE = 2.0
-PARTIAL_BOOK_FRACTION = 0.5
 STALL_CANDLES_FOR_REVERSAL_EXIT = 3
 
 # ---------------- BLACKLIST ----------------

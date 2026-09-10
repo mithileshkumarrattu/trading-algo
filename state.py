@@ -175,6 +175,10 @@ def set_open_position(security_id, item: dict):
         _write_raw(data)
 
 
+def add_open_position(security_id, item: dict):
+    set_open_position(security_id, item)
+
+
 def remove_open_position(security_id):
     with _LOCK:
         data = _read_raw()
@@ -198,6 +202,13 @@ def add_to_daily_pnl(amount: float):
     with _LOCK:
         data = _read_raw()
         data["daily_pnl"] = round(data.get("daily_pnl", 0.0) + amount, 2)
+        data["daily_trade_count"] = data.get("daily_trade_count", 0) + 1
+        _write_raw(data)
+
+
+def increment_trade_count():
+    with _LOCK:
+        data = _read_raw()
         data["daily_trade_count"] = data.get("daily_trade_count", 0) + 1
         _write_raw(data)
 
